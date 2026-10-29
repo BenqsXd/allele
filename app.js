@@ -18,7 +18,7 @@ function parseLines(lines, from, to, geno, meta) {
     let g = (p.length >= 5 && p[3].length === 1 && p[4].length === 1) ? p[3] + p[4] : (p[3] || '');
     g = g.toUpperCase();
     if (!/^[ACGT]{1,2}$/.test(g)) continue; // no-calls (--, 00), indels (DI)
-    geno.set(p[0].toLowerCase(), { g: g.length === 1 ? g + g : g, chr: p[1] });
+    geno.set(p[0].toLowerCase(), { g: g.length === 1 ? g + g : g, chr: p[1], pos: +p[2] });
   }
 }
 function parseRaw(text) {
@@ -140,6 +140,111 @@ function relationReading(c) {
   return 'No close relationship detected';
 }
 
+// ---------- read check: genotype calls vs the sequencing reads in a CRAM ----------
+// Sites are the person's ClinVar hits and curated markers, at GRCh37 positions with a known reference base.
+function readSites(p) {
+  const sites = new Map();
+  for (const h of p.hits) {
+    const r = p.geno.get(h.id);
+    if (r && r.pos) sites.set(`${r.chr}:${r.pos}`, { id: h.id, chr: r.chr, pos: r.pos, ref: h.ref });
+  }
+  for (const f of p.found) {
+    const snp = [f.e, ...(f.e.proxies || [])].find(s => s.id === f.r.id);
+    if (!snp || !snp.b37) continue;
+    const [chr, pos, ref] = snp.b37.split(':');
+    sites.set(`${chr}:${pos}`, { id: snp.id, chr, pos: +pos, ref });
+  }
+  return [...sites.values()];
+}
+
+// Base a read carries at 1-based reference position pos, and its index in the read for the quality lookup.
+// CRAM read features hold 0-based refPos; a position with no feature carries the reference base.
+function baseAt(features, readStart0, pos, refBase) {
+  let base = refBase, shift = 0;
+  for (const ft of features) {
+    const fp = ft.refPos + 1;
+    if (fp > pos) break;
+    if (ft.code === 'D' || ft.code === 'N') { if (pos < fp + ft.data) return null; shift -= ft.data; continue; }
+    if (ft.code === 'I' || ft.code === 'S') { shift += ft.data.length; continue; } // inserted bases sit before refPos
+    if (ft.code === 'i') { shift += 1; continue; }
+    if (fp === pos && ft.code === 'X') base = ft.sub || 'N';
+    if (fp === pos && ft.code === 'B') base = ft.data[0];
+  }
+  return { base, index: pos - readStart0 - 1 + shift };
+}
+
+// What the reads say about the file's genotype g at a site with reference base ref; obs = base counts.
+function readVerdict(g, ref, obs) {
+  const depth = 'ACGT'.split('').reduce((s, b) => s + (obs[b] || 0), 0);
+  const alts = [...new Set(g)].filter(b => b !== ref);
+  const altSeen = alts.reduce((s, b) => s + (obs[b] || 0), 0), refSeen = obs[ref] || 0;
+  const other = depth - altSeen - refSeen;
+  if (!depth) return { key: 'none', label: 'No reads', depth };
+  if (alts.length) {
+    if (altSeen) return { key: 'seen', label: 'Seen in reads', depth, altSeen, refSeen };
+    return { key: 'missing', label: `Not seen in ${depth} read${depth > 1 ? 's' : ''}`, depth, altSeen, refSeen };
+  }
+  if (other) return { key: 'conflict', label: 'Reads show another allele', depth, altSeen: other, refSeen };
+  return { key: 'agree', label: 'Matches reads', depth, altSeen, refSeen };
+}
+
+async function runReadCheck(blob, sites, CramFile, BlobFile, onProgress = () => {}) {
+  const file = new CramFile({
+    filehandle: new BlobFile(blob),
+    // Only the bases at the checked sites are needed; everything else reads as N.
+    fetchReferenceSequence: async (seqId, start, end) => {
+      const s = new Array(end - start).fill('N');
+      for (const x of bySeq.get(seqId) || []) if (x.pos - 1 >= start && x.pos - 1 < end) s[x.pos - 1 - start] = x.ref;
+      return s.join('');
+    },
+  });
+  const sq = (await file.getSamHeader()).filter(l => l.tag === 'SQ').map(l => Object.fromEntries(l.data.map(d => [d.tag, d.value])));
+  const chr1 = sq.find(s => /^(chr)?1$/i.test(s.SN));
+  if (!chr1) throw new Error('This CRAM has no chromosome 1 in its header, so it cannot be matched to genotype positions.');
+  if (+chr1.LN !== 249250621) throw new Error(`This CRAM is aligned to ${+chr1.LN === 248956422 ? 'GRCh38' : 'an unknown reference'}; the read check needs GRCh37 (build 37) alignments, like MyHeritage's.`);
+  const bySeq = new Map();
+  sq.forEach((s, i) => {
+    const list = sites.filter(x => x.chr.toUpperCase() === s.SN.replace(/^chr/i, '').toUpperCase()).sort((a, b) => a.pos - b.pos);
+    if (list.length) bySeq.set(i, list);
+  });
+  const obs = new Map(sites.map(x => [x.id, {}]));
+  const anyIn = (list, lo, hi) => { let a = 0, b = list.length; while (a < b) { const m = (a + b) >> 1; if (list[m].pos < lo) a = m + 1; else b = m; } return a < list.length && list[a].pos <= hi ? a : -1; };
+  let containers = 0, decoded = 0, reads = 0;
+  try {
+    for await (const c of file.iterContainers()) {
+      const h = await c.getHeader();
+      containers++;
+      onProgress(Math.min(1, h._endPosition / blob.size));
+      if (containers === 1) continue; // the first container holds the SAM header
+      if (!h.numRecords || h.refSeqId === -1) break; // EOF marker, or the unmapped reads sorted last
+      const list = bySeq.get(h.refSeqId);
+      if (h.refSeqId >= 0 && (!list || anyIn(list, h.refSeqStart - 1000, h.refSeqStart + h.alignmentSpan + 1000) < 0)) continue;
+      decoded++;
+      for (const lm of h.landmarks) {
+        for (const r of await c.getSlice(lm).getRecords(() => true)) {
+          if (r.flags & 0xF04 || (r.mappingQuality ?? 60) < 20) continue;
+          const sl = bySeq.get(r.sequenceId);
+          if (!sl) continue;
+          let i = anyIn(sl, r.start + 1, r.end);
+          if (i < 0) continue;
+          reads++;
+          const feats = r.readFeatures || [], q = r.qualityScores;
+          for (; i < sl.length && sl[i].pos <= r.end; i++) {
+            const x = sl[i], hit = baseAt(feats, r.start, x.pos, x.ref);
+            if (!hit || !'ACGT'.includes(hit.base) || (q && q[hit.index] < 20)) continue;
+            const o = obs.get(x.id);
+            o[hit.base] = (o[hit.base] || 0) + 1;
+          }
+        }
+      }
+    }
+  } catch (err) {
+    if (!containers) throw err; // reading past the last container is how the walk ends
+  }
+  onProgress(1);
+  return { obs, containers, decoded, reads };
+}
+
 function personName(file) {
   const f = file.replace(/\.[^.]+$/, '');
   const m = f.match(/MyHeritage_raw_dna_data_(.+)/i) || f.match(/^genome_(.+?)_v\d/i);
@@ -199,6 +304,23 @@ if (typeof window !== 'undefined') (() => {
   }
   const refHtml = ref => esc(ref).replace(/PMID (\d+)/g, '<a href="https://pubmed.ncbi.nlm.nih.gov/$1/" target="_blank" rel="noopener">PMID $1</a>');
 
+  // The person whose tables are being drawn: the current one, or the one a report is exported for.
+  let RP = null;
+  const rp = () => RP || P();
+  const READ_CLS = { seen: 'good', missing: 'warn', conflict: 'bad', agree: '', none: '' };
+  function readVerdictFor(p, id, g) {
+    const rc = p.readCheck, o = rc && rc.obs.get(id);
+    return o ? readVerdict(g, rc.ref.get(id), o) : null;
+  }
+  function readsTd(id, g) {
+    const p = rp();
+    if (!p.readCheck) return '';
+    const v = readVerdictFor(p, id, g);
+    if (!v) return '<td><span class="muted">Not checked</span></td>';
+    const o = p.readCheck.obs.get(id), counts = Object.entries(o).sort((a, b) => b[1] - a[1]).map(([b, n]) => `${b} ${n}`).join(' · ');
+    return `<td><span class="pill ${READ_CLS[v.key]}">${esc(v.label)}</span>${counts ? `<span class="gt-note mono">${counts}</span>` : ''}</td>`;
+  }
+
   function markerRow(f, val, w) {
     const { e, r } = f;
     const label = val === undefined ? '' : impactPill(w > 0 && r.k > 0 && val >= 0 ? 1 : val);
@@ -207,10 +329,11 @@ if (typeof window !== 'undefined') (() => {
       <td>${gtCells(r.g, r.alt)}<span class="gt-note">effect allele ${esc(r.alt)}${r.proxy ? ` · via ${esc(r.id)}` : ''}</span></td>
       <td class="effect"><span class="t">${esc(e.trait)}</span>${esc(genoText(e, r.k))}</td>
       <td>${evidence(e.ev)}</td>
-      <td>${label}</td>
+      <td>${label}</td>${readsTd(r.id, r.g)}
       <td class="src">${refHtml(e.ref)}<br>${links(e, r.id)}</td></tr>`;
   }
-  const markerHead = '<table class="rows"><thead><tr><th>Gene</th><th>Genotype</th><th>Effect</th><th>Evidence</th><th>Impact</th><th>Sources</th></tr></thead><tbody>';
+  const readsTh = () => rp().readCheck ? '<th>Sequencing reads</th>' : '';
+  const markerHead = () => `<table class="rows"><thead><tr><th>Gene</th><th>Genotype</th><th>Effect</th><th>Evidence</th><th>Impact</th>${readsTh()}<th>Sources</th></tr></thead><tbody>`;
 
   // The score ladder: one rung per category; grey ticks = markers, blue dot = category score.
   function ladder(cats, opts = {}) {
@@ -328,9 +451,24 @@ if (typeof window !== 'undefined') (() => {
     </div>`;
   }
 
-  function titleRow(h1, sub, finding, actions = true) {
+  function titleRow(h1, sub, finding, actions = true, reads = false) {
     return `<div class="title-row"><div><h1>${h1}</h1>${sub ? `<p class="sub">${sub}</p>` : ''}${finding ? `<p class="finding">${finding}</p>` : ''}</div>
-      ${actions ? `<div class="actions"><button class="btn" data-act="print">Print or save PDF</button><button class="btn primary" data-act="download">Download report</button></div>` : ''}</div>`;
+      ${actions ? `<div class="actions">${reads ? `<button class="btn" data-act="cram"${state.readJob ? ' disabled' : ''}>${rp().readCheck ? 'Check other reads' : 'Check against reads'}</button>` : ''}<button class="btn" data-act="print">Print or save PDF</button><button class="btn primary" data-act="download">Download report</button></div>` : ''}</div>`;
+  }
+
+  // The read check's status line: progress while scanning, the summary when done, or the error.
+  function readNotice(p) {
+    if (state.readJob && state.readJob.p === p) return `<div class="card readbar" role="status"><div><b>Checking against ${esc(state.readJob.name)}</b><span class="small muted" id="readPct"> 0%</span></div><span class="progress"><i id="readProg" style="--p:0"></i></span></div>`;
+    if (p.readError) return `<p class="err" role="alert">${esc(p.readError)}</p>`;
+    const rc = p.readCheck;
+    if (!rc) return '';
+    const t = { seen: 0, missing: 0, conflict: 0, agree: 0, none: 0 };
+    for (const [id, ref] of rc.ref) t[readVerdict(p.geno.get(id).g, ref, rc.obs.get(id)).key]++;
+    const covered = rc.ref.size - t.none;
+    const wrong = rc.n >= 50 && rc.disc / rc.n > 0.03;
+    return `<div class="card readbar${wrong ? ' bad' : ''}"><div><b>Read check: ${esc(rc.file)}</b>
+      <p class="small muted" style="margin:2px 0 0">${covered} of ${rc.ref.size} checked sites are covered by reads (${fmt(rc.reads)} reads at about 1× coverage). Variants this file carries: ${t.seen} seen in reads, ${t.missing} not seen${t.missing ? ' (at 1–2 reads a single copy is easily missed)' : ''}. ${t.conflict ? `${t.conflict} sites where reads show an allele this file doesn't have. ` : ''}${t.agree} other sites match.</p>
+      ${wrong ? `<p class="small" style="margin:6px 0 0"><b>These reads may not be ${esc(p.name)}'s:</b> ${(rc.disc / rc.n * 100).toFixed(1)}% of read bases are not in this file's genotypes (expected under 2% for the same person).</p>` : ''}</div></div>`;
   }
   const lowPass = p => /low-pass/i.test(p.method) ? `<div class="notice" role="note"><span>Low-pass sequencing: most genotypes in this file are imputed, not read directly. Common variants are usually right; rare variants (most ClinVar “pathogenic” calls) are often wrong. Confirm anything important with a clinical test.</span></div>` : '';
 
@@ -359,14 +497,14 @@ if (typeof window !== 'undefined') (() => {
       ...p.notable.map(n => ({ gene: n.f.e.gene, id: n.f.e.id, g: n.f.r.g, alt: n.f.r.alt, text: n.f.e.trait, pill: n.w > 0 ? '<span class="pill good">Protective</span>' : '<span class="pill bad">Unfavourable</span>', href: `#/category/${Object.keys(n.f.e.cats)[0]}` })),
     ];
     if (!items.length) return '<p class="empty">No high-impact unfavourable markers or pathogenic variants found.</p>';
-    return `<ul class="list">${items.slice(0, cap).map(it => `<li><span><a href="${it.href}" class="link">${esc(it.gene)}</a> ${gtCells(it.g, it.alt)}</span>${it.pill}<span class="meta">${esc(it.text)} · <span class="mono">${esc(it.id)}</span></span></li>`).join('')}</ul>
+    return `<ul class="list">${items.slice(0, cap).map(it => `<li><span><a href="${it.href}" class="link">${esc(it.gene)}</a> ${gtCells(it.g, it.alt)}</span>${it.pill}<span class="meta">${esc(it.text)} · <span class="mono">${esc(it.id)}</span>${(v => v ? ` · reads: ${esc(v.label.toLowerCase())}` : '')(readVerdictFor(p, it.id, it.g))}</span></li>`).join('')}</ul>
       ${items.length > cap ? `<p class="small muted" style="margin:12px 0 0">${items.length - cap} more in Categories and Gene scan.</p>` : ''}`;
   }
 
   function viewOverview(p) {
     return `<div class="view">
-      ${titleRow(esc(p.name), `${esc(p.file)} · ${fmt(p.geno.size)} SNPs${p.method ? ' · ' + esc(p.method) : ''}${p.build ? ' · ' + p.build : ''}`, overviewFinding(p))}
-      ${lowPass(p)}
+      ${titleRow(esc(p.name), `${esc(p.file)} · ${fmt(p.geno.size)} SNPs${p.method ? ' · ' + esc(p.method) : ''}${p.build ? ' · ' + p.build : ''}`, overviewFinding(p), true, true)}
+      ${readNotice(p)}${lowPass(p)}
       <div class="card stats">
         <div class="stat"><span>SNPs read</span><b data-count="${p.geno.size}" data-suffix="">${fmt(p.geno.size)}</b></div>
         <div class="stat"><span>Curated markers found</span><b><span data-count="${p.found.length}" data-suffix="">${p.found.length}</span> <small>of ${SNP_DB.length}</small></b></div>
@@ -391,11 +529,12 @@ if (typeof window !== 'undefined') (() => {
     const chips = p.cats.filter(x => x.total).map(x => `<a class="chip" href="#/category/${x.key}"${x.key === c.key ? ' aria-current="page"' : ''}>${esc(x.name)} <span class="num">${pctTxt(x.score)}</span></a>`).join('');
     const fav = c.items.filter(i => i.val > 0.3).length, unf = c.items.filter(i => i.val < -0.3).length;
     return `<div class="view">
-      ${titleRow(esc(c.name), esc(c.desc), `${c.items.length} of ${c.total} markers found in this file · ${fav} favourable, ${unf} unfavourable.`)}
+      ${titleRow(esc(c.name), esc(c.desc), `${c.items.length} of ${c.total} markers found in this file · ${fav} favourable, ${unf} unfavourable.`, true, true)}
+      ${readNotice(p)}
       <nav class="cats" aria-label="Categories">${chips}</nav>
       <section class="card" style="margin-bottom:var(--gap)">${c.score === null ? '<p class="empty">None of this category’s markers are in this file.</p>' : ladder([c])}</section>
       <section class="card" aria-labelledby="h-mk"><div class="card-head"><h2 id="h-mk">Markers</h2><span class="small muted">sorted from least to most favourable</span></div>
-        <div class="tablewrap">${markerHead}${c.items.map(i => markerRow(i.f, i.val, i.w)).join('')}</tbody></table></div>
+        <div class="tablewrap">${markerHead()}${c.items.map(i => markerRow(i.f, i.val, i.w)).join('')}</tbody></table></div>
         ${c.missing.length ? `<p class="small muted" style="margin:14px 0 0">Not in this file: ${c.missing.map(f => `${esc(f.e.gene)} <span class="mono">${esc(f.e.id)}</span>${f.r && f.r.mismatch ? ' (allele mismatch)' : ''}`).join(', ')}.</p>` : ''}
       </section>
     </div>`;
@@ -407,10 +546,10 @@ if (typeof window !== 'undefined') (() => {
       <td>${gtCells(x.g, x.alt)}<span class="gt-note">${x.ref}&gt;${x.alt} · ${x.k === 2 ? 'two copies' : 'one copy'}</span></td>
       <td class="effect">${esc(x.cond)}</td>
       <td class="num" aria-label="${x.stars} of 4 review stars">${x.stars ? `${x.stars} of 4` : '—'}</td>
-      <td><span class="pill ${x.sig === 'P' || x.sig === 'LP' ? 'bad' : x.sig === 'RF' ? 'warn' : x.sig === 'PR' ? 'good' : ''}">${SIG[x.sig]}</span></td>
+      <td><span class="pill ${x.sig === 'P' || x.sig === 'LP' ? 'bad' : x.sig === 'RF' ? 'warn' : x.sig === 'PR' ? 'good' : ''}">${SIG[x.sig]}</span></td>${readsTd(x.id, x.g)}
       <td class="src"><a href="https://www.ncbi.nlm.nih.gov/clinvar/variation/${x.vid}/" target="_blank" rel="noopener">ClinVar ${x.vid}</a>${links(null, x.id)}</td></tr>`).join('');
   }
-  const cvHead = '<table class="rows"><thead><tr><th>Gene</th><th>Genotype</th><th>Condition or drug</th><th class="num">Review</th><th>Classification</th><th>Sources</th></tr></thead><tbody>';
+  const cvHead = () => `<table class="rows"><thead><tr><th>Gene</th><th>Genotype</th><th>Condition or drug</th><th class="num">Review</th><th>Classification</th>${readsTh()}<th>Sources</th></tr></thead><tbody>`;
   function cvFiltered(p) {
     const q = state.cvQuery.toLowerCase();
     return p.hits.filter(h => (state.cvSig === 'all' || h.sig === state.cvSig) && h.stars >= state.cvStars && (!q || (h.gene + ' ' + h.cond + ' ' + h.id).toLowerCase().includes(q)));
@@ -419,8 +558,8 @@ if (typeof window !== 'undefined') (() => {
     if (!hasClinvar()) return `<div class="view">${titleRow('Gene scan', '', '', false)}<p class="empty">ClinVar data isn’t loaded. Run <code>python build_clinvar.py</code> next to index.html, then reload.</p></div>`;
     const segs = [['all', 'All'], ...Object.entries(SIG)].map(([k, v]) => `<button data-sig="${k}" aria-pressed="${state.cvSig === k}">${v} <span class="num muted">${k === 'all' ? p.hits.length : p.hits.filter(h => h.sig === k).length}</span></button>`).join('');
     return `<div class="view">
-      ${titleRow('Gene scan', `Every SNP in ${esc(p.name)}’s file checked against NCBI ClinVar (${esc(CLINVAR_DATE)}, ${fmt(Object.keys(CLINVAR).length)} classified variants). Listed: variants where the classified allele is carried.`, p.plp.length ? `${p.plp.length} pathogenic or likely pathogenic, ${p.plp.filter(h => h.k === 1).length} of them as a single copy. For recessive conditions one copy means carrier status only.` : 'No pathogenic or likely pathogenic variants carried.')}
-      ${lowPass(p)}
+      ${titleRow('Gene scan', `Every SNP in ${esc(p.name)}’s file checked against NCBI ClinVar (${esc(CLINVAR_DATE)}, ${fmt(Object.keys(CLINVAR).length)} classified variants). Listed: variants where the classified allele is carried.`, p.plp.length ? `${p.plp.length} pathogenic or likely pathogenic, ${p.plp.filter(h => h.k === 1).length} of them as a single copy. For recessive conditions one copy means carrier status only.` : 'No pathogenic or likely pathogenic variants carried.', true, true)}
+      ${readNotice(p)}${lowPass(p)}
       <section class="card" aria-labelledby="h-cv">
         <div class="card-head"><h2 id="h-cv">Variants carried</h2><span class="small muted num" id="cvCount"></span></div>
         <div class="toolbar"><div class="seg" role="group" aria-label="Classification">${segs}</div>
@@ -431,14 +570,14 @@ if (typeof window !== 'undefined') (() => {
   }
   function drawCv() {
     const hits = cvFiltered(P()), shown = hits.slice(0, 400);
-    $('#cvTable').innerHTML = hits.length ? `${cvHead}${cvRows(shown)}</tbody></table>` : '<p class="empty">No carried variants match these filters.</p>';
+    $('#cvTable').innerHTML = hits.length ? `${cvHead()}${cvRows(shown)}</tbody></table>` : '<p class="empty">No carried variants match these filters.</p>';
     $('#cvCount').textContent = `${shown.length} of ${P().hits.length}`;
   }
 
   function viewTraits(p) {
     const traits = p.found.filter(f => !Object.keys(f.e.cats).length);
     return `<div class="view">${titleRow('Traits', 'Characteristics with no better or worse genotype. Not scored.', '')}
-      <section class="card"><div class="tablewrap">${traits.length ? markerHead.replace('<th>Impact</th>', '<th></th>') + traits.map(f => markerRow(f)).join('') + '</tbody></table>' : '<p class="empty">None of the trait markers are in this file.</p>'}</div></section></div>`;
+      <section class="card"><div class="tablewrap">${traits.length ? markerHead().replace('<th>Impact</th>', '<th></th>') + traits.map(f => markerRow(f)).join('') + '</tbody></table>' : '<p class="empty">None of the trait markers are in this file.</p>'}</div></section></div>`;
   }
 
   function cmpPeople() { return state.people.filter((_, i) => !state.cmpSel || state.cmpSel.has(i)); }
@@ -530,22 +669,27 @@ if (typeof window !== 'undefined') (() => {
         <p><b>Scores.</b> Each marker scores +1 for its best genotype and −1 for its worst; heterozygotes fall in between according to the variant’s model (additive, dominant or recessive). Markers are weighted by effect size (1–3) times evidence (strong 1, moderate 0.75, limited 0.5). Category score = 50 + 50 × the weighted mean, so 100% is the best combination possible for the markers tested, 50% an even balance and 0% the worst possible. A typical person can score low where most people lack a rare protective variant.</p>
         <p><b>Gene scan.</b> Every SNP is checked against NCBI ClinVar${hasClinvar() ? ` (${esc(CLINVAR_DATE)})` : ''}: pathogenic and likely pathogenic variants with at least one review star, plus risk factors, protective variants and drug responses. Refresh with <code>python build_clinvar.py --refresh</code>.</p>
         <p><b>Comparison.</b> Genotype match is the share of SNPs present in both files where both people have the same genotype. Relatedness uses autosomal SNPs only and the KING-robust kinship estimator (Manichaikul et al. 2010): about 0.25 for parent–child and full siblings, 0.125 for second-degree relatives; opposite homozygotes (e.g. AA against GG), near zero only between parent and child, separate those two. Health-profile similarity is 100 minus the mean gap between category scores.</p>
+        <p><b>Read check.</b> A MyHeritage CRAM file holds the sequencing reads the genotype file was imputed from. “Check against reads” scans it in the browser and counts, at each ClinVar hit and curated marker, which bases the reads carry (mapping quality and base quality 20 or more). A variant “seen in reads” is confirmed directly; at about 1× coverage most sites have 0–2 reads, so “not seen” in one or two reads is weak evidence against a single copy. The CRAM must be aligned to GRCh37. If the reads disagree with the genotype file at more than 3% of bases, the check warns that they may belong to someone else.</p>
         <p><b>Limits.</b> Most traits depend on hundreds of variants plus lifestyle and environment; these scores cover a few known variants with mostly small effects (odds ratios 1.1–1.5), measured mainly in people of European ancestry. Consumer arrays and low-pass sequencing miss most rare mutations (most BRCA1/2 variants), copy-number changes and CYP2D6 duplications. This is education and research, not diagnosis — talk to a doctor or genetic counsellor before acting on a result.</p>
       </section></div>`;
   }
 
   // ---------- exported / printed report ----------
   function reportHTML(p) {
+    RP = p;
+    try { return reportBody(p); } finally { RP = null; }
+  }
+  function reportBody(p) {
     const traits = p.found.filter(f => !Object.keys(f.e.cats).length);
     return `<div class="report">
       ${titleRow(`Genetic report — ${esc(p.name)}`, `${esc(p.file)} · ${fmt(p.geno.size)} SNPs · generated ${new Date().toLocaleString()}`, overviewFinding(p), false)}
-      ${lowPass(p)}
+      ${readNotice(p)}${lowPass(p)}
       <section><h2>Category scores</h2><div class="card">${ladder(p.cats.filter(c => c.score !== null), { static: true })}</div></section>
       <section><h2>Needs attention</h2><div class="card">${attentionList(p, 50)}</div></section>
       <section><h2>At a glance</h2><div class="card">${glance(p)}</div></section>
-      ${p.cats.filter(c => c.items.length).map(c => `<section><h2>${esc(c.name)} — ${pctTxt(c.score)}</h2><p class="sub small">${esc(c.desc)}</p><div class="card">${markerHead}${c.items.map(i => markerRow(i.f, i.val, i.w)).join('')}</tbody></table></div></section>`).join('')}
-      ${traits.length ? `<section><h2>Traits</h2><div class="card">${markerHead}${traits.map(f => markerRow(f)).join('')}</tbody></table></div></section>` : ''}
-      ${p.hits.length ? `<section><h2>ClinVar gene scan</h2><div class="card">${cvHead}${cvRows(p.hits)}</tbody></table></div></section>` : ''}
+      ${p.cats.filter(c => c.items.length).map(c => `<section><h2>${esc(c.name)} — ${pctTxt(c.score)}</h2><p class="sub small">${esc(c.desc)}</p><div class="card">${markerHead()}${c.items.map(i => markerRow(i.f, i.val, i.w)).join('')}</tbody></table></div></section>`).join('')}
+      ${traits.length ? `<section><h2>Traits</h2><div class="card">${markerHead()}${traits.map(f => markerRow(f)).join('')}</tbody></table></div></section>` : ''}
+      ${p.hits.length ? `<section><h2>ClinVar gene scan</h2><div class="card">${cvHead()}${cvRows(p.hits)}</tbody></table></div></section>` : ''}
       <section>${viewMethod().replace(/<div class="view">|<\/div>$/g, '')}</section></div>`;
   }
   function staticize(html) {
@@ -617,6 +761,7 @@ if (typeof window !== 'undefined') (() => {
     if (!t) return;
     if (t.dataset.act === 'download') doDownload();
     else if (t.dataset.act === 'print') doPrint();
+    else if (t.dataset.act === 'cram') $('#cramFile').click();
     else if (t.dataset.sig) { state.cvSig = t.dataset.sig; main.querySelectorAll('[data-sig]').forEach(b => b.setAttribute('aria-pressed', b === t)); drawCv(); }
     else if (t.dataset.cmpMode) { state.cmpMode = t.dataset.cmpMode; main.querySelectorAll('[data-cmp-mode]').forEach(b => b.setAttribute('aria-pressed', b === t)); drawMarkers(); }
     else if (t.dataset.pick) {
@@ -647,8 +792,51 @@ if (typeof window !== 'undefined') (() => {
   });
   $('#menuBtn').addEventListener('click', () => { const o = $('#side').classList.toggle('open'); $('#menuBtn').setAttribute('aria-expanded', o); });
 
+  // ---------- read check ----------
+  let cramLib;
+  const loadCramLib = () => cramLib ??= new Promise((ok, fail) => {
+    const s = document.createElement('script');
+    s.src = 'vendor/cram.js';
+    s.onload = () => ok(window.CramLib);
+    s.onerror = () => fail(new Error('Could not load vendor/cram.js, the CRAM reader.'));
+    document.head.appendChild(s);
+  });
+  async function checkReads(file) {
+    const p = P();
+    if (!p || state.readJob) return;
+    p.readError = '';
+    state.readJob = { p, name: file.name };
+    render();
+    try {
+      const lib = await loadCramLib();
+      const sites = readSites(p);
+      let last = 0;
+      const res = await runReadCheck(file, sites, lib.CramFile, lib.BlobFile, k => {
+        const now = performance.now();
+        if (now - last < 100 && k < 1) return;
+        last = now;
+        const bar = $('#readProg'), pct = $('#readPct');
+        if (bar) bar.style.setProperty('--p', k);
+        if (pct) pct.textContent = ` ${Math.round(k * 100)}%`;
+      });
+      let n = 0, disc = 0;
+      for (const x of sites) for (const [b, c] of Object.entries(res.obs.get(x.id))) { n += c; if (!p.geno.get(x.id).g.includes(b)) disc += c; }
+      p.readCheck = { file: file.name, obs: res.obs, ref: new Map(sites.map(x => [x.id, x.ref])), n, disc, reads: res.reads };
+    } catch (err) {
+      p.readError = `${file.name}: ${err.message}`;
+    }
+    state.readJob = null;
+    render();
+  }
+  $('#cramFile').onchange = e => { if (e.target.files[0]) checkReads(e.target.files[0]); e.target.value = ''; };
+
   async function readFiles(files) {
     files = [...files].filter(f => f.size);
+    const cram = files.find(f => /\.cram$/i.test(f.name));
+    if (cram) {
+      if (P()) checkReads(cram); else { state.error = 'Load the person’s raw DNA file (.csv or .txt) first, then check it against the CRAM reads.'; render(); }
+      files = files.filter(f => f !== cram);
+    }
     if (!files.length) return;
     state.error = '';
     const before = state.people.length;

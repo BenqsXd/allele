@@ -6,7 +6,7 @@
 <title>Allele — DNA report</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Cpath d=%27M7 2c0 6 10 8 10 14M17 2c0 6-10 8-10 14M7 22c0-2 1-3.5 2.5-4.5M17 22c0-2-1-3.5-2.5-4.5M8.5 6h7M8.5 12h7%27 fill=%27none%27 stroke=%27%231d5fbf%27 stroke-width=%271.8%27 stroke-linecap=%27round%27/%3E%3C/svg%3E">
 <!-- No network: scripts may not fetch, post or open sockets; fonts and scripts load only from this site. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' file:; style-src 'self' 'unsafe-inline'; font-src 'self' file:; img-src 'self' data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' file: 'wasm-unsafe-eval'; worker-src blob:; style-src 'self' 'unsafe-inline'; font-src 'self' file:; img-src 'self' data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'">
 <style>
 /* Geist and Geist Mono (SIL Open Font License, fonts/OFL.txt), served from this folder. */
 @font-face { font-family: 'Geist'; font-style: normal; font-weight: 400 700; font-display: swap; src: url(fonts/geist-latin-ext.woff2) format('woff2'); unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF; }
@@ -102,6 +102,11 @@ h2 { margin: 0; font-size: var(--fs-section); line-height: 22px; font-weight: 50
 .legend > span, .who { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .stack { display: grid; gap: var(--gap); }
 .row2 { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: var(--gap); align-items: start; }
+.readbar { display: grid; gap: 10px; margin-bottom: var(--gap); padding: 14px var(--card-pad); }
+.readbar b { font-weight: 500; }
+.readbar .progress { margin: 0; width: 100%; }
+.readbar.bad { border-color: #f3b4ae; }
+.btn:disabled { opacity: .5; cursor: default; }
 .notice { display: flex; gap: 10px; align-items: flex-start; padding: 9px 12px; margin-bottom: var(--gap); border: 1px solid #fde68a; background: var(--pill-warning-bg); color: var(--pill-warning-ink); border-radius: var(--radius-control); font-size: var(--fs-small); line-height: 16px; }
 
 /* stat strip: one card split by hairlines */
@@ -307,6 +312,7 @@ select.search { width: auto; }
 </div>
 <div class="pop" id="pop" role="tooltip" hidden></div>
 <div id="print" class="print-only"></div>
+<input type="file" id="cramFile" accept=".cram" hidden>
 
 <script src="db.js"></script>
 <script src="app.js"></script>

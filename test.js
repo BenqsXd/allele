@@ -47,4 +47,15 @@ assert.strictEqual(ctx.compareGenomes(new Map([['rs9', { g: 'AA', chr: 'X' }], .
 assert.strictEqual(ctx.personName('MyHeritage_raw_dna_data_Sample.csv'), 'Sample');
 assert.strictEqual(ctx.personName('genome_Anna_Berzina_v5_Full_20240101.txt'), 'Anna Berzina');
 
+// Read check: base at a position from CRAM read features (0-based refPos), and the verdict on a genotype
+const feats = [{ code: 'S', refPos: 99, data: 'AA' }, { code: 'X', refPos: 104, sub: 'G' }, { code: 'D', refPos: 109, data: 2 }];
+assert.strictEqual(JSON.stringify(ctx.baseAt(feats, 99, 105, 'A')), JSON.stringify({ base: 'G', index: 7 }));
+assert.strictEqual(JSON.stringify(ctx.baseAt(feats, 99, 103, 'C')), JSON.stringify({ base: 'C', index: 5 }));
+assert.strictEqual(ctx.baseAt(feats, 99, 110, 'C'), null);
+assert.strictEqual(JSON.stringify(ctx.baseAt(feats, 99, 113, 'T')), JSON.stringify({ base: 'T', index: 13 }));
+assert.strictEqual(ctx.readVerdict('AG', 'G', { A: 1, G: 2 }).key, 'seen');
+assert.strictEqual(ctx.readVerdict('AG', 'G', { G: 2 }).key, 'missing');
+assert.strictEqual(ctx.readVerdict('GG', 'G', { A: 1 }).key, 'conflict');
+assert.strictEqual(ctx.readVerdict('GG', 'G', {}).key, 'none');
+
 console.log(`ok — ${SNP_DB.length} markers, ${Object.keys(CATEGORIES).length} categories`);

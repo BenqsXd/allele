@@ -3,3 +3,6 @@ data/
 .taste-skill/
 .playwright-mcp/
 *.csv
+*.cram
+*.crai
+*.bam
