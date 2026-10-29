@@ -1,4 +1,6 @@
-# DNA Variant Analyzer
+# Allele — DNA Variant Analyzer
+
+Version 1.0.2 · [Download](https://github.com/BenqsXd/allele/releases/latest)
 
 Live: https://benqsxd.github.io/allele/
 

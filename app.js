@@ -1,6 +1,7 @@
 'use strict';
 // Allele — offline DNA report. Analysis core first (pure, tested by test.js), then the interface.
 
+const VERSION = '1.0.2';
 const EVF = { strong: 1, moderate: 0.75, limited: 0.5 };
 const SIG = { P: 'Pathogenic', LP: 'Likely pathogenic', RF: 'Risk factor', DR: 'Drug response', PR: 'Protective' };
 const HUES = [205, 25, 145, 330, 85, 265];
@@ -682,7 +683,7 @@ if (typeof window !== 'undefined') (() => {
   function reportBody(p) {
     const traits = p.found.filter(f => !Object.keys(f.e.cats).length);
     return `<div class="report">
-      ${titleRow(`Genetic report — ${esc(p.name)}`, `${esc(p.file)} · ${fmt(p.geno.size)} SNPs · generated ${new Date().toLocaleString()}`, overviewFinding(p), false)}
+      ${titleRow(`Genetic report — ${esc(p.name)}`, `${esc(p.file)} · ${fmt(p.geno.size)} SNPs · generated ${new Date().toLocaleString()} by Allele ${VERSION}`, overviewFinding(p), false)}
       ${readNotice(p)}${lowPass(p)}
       <section><h2>Category scores</h2><div class="card">${ladder(p.cats.filter(c => c.score !== null), { static: true })}</div></section>
       <section><h2>Needs attention</h2><div class="card">${attentionList(p, 50)}</div></section>
@@ -882,6 +883,7 @@ if (typeof window !== 'undefined') (() => {
 
   // clinvar.js is deferred; it has run by DOMContentLoaded (or failed to load, and the gene scan says so)
   addEventListener('DOMContentLoaded', () => { state.people.forEach(refreshClinvar); render(); });
+  $('#ver').textContent = `Allele ${VERSION}`;
   window.allele = { readFiles, state }; // handy for debugging from the console
   render();
 })();
