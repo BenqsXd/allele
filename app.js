@@ -1408,6 +1408,7 @@ if (typeof window !== 'undefined') (() => {
         yHap: yHaplogroup(res.obs, Y_SNPS), dosage: chromosomeDosage(res.depth, res.seqNames) };
       if (!p.readCheck.dosage.hasMT) p.readCheck.mt = null; // no mitochondrial reads: MT-RNR1 stays untested
       p._pgx = null; // MT-RNR1 can now be called
+      store.save(p);
     } catch (err) {
       p.readError = `${file.name}: ${err.message}`;
     }
@@ -1416,7 +1417,7 @@ if (typeof window !== 'undefined') (() => {
   }
   $('#cramFile').onchange = e => { if (e.target.files[0]) checkReads(e.target.files[0]); e.target.value = ''; };
 
-  // ---------- saved sessions (opt-in; raw files kept in this browser's IndexedDB only) ----------
+  // ---------- saved sessions (opt-in; raw files and read-check results kept in this browser's IndexedDB only) ----------
   const store = {
     on: () => { try { return localStorage.getItem('allele.remember') === '1'; } catch { return false; } },
     db: () => new Promise((ok, fail) => {
@@ -1433,7 +1434,8 @@ if (typeof window !== 'undefined') (() => {
         t.onerror = () => fail(t.error);
       });
     },
-    save: (name, file, text) => store.on() && store.tx('readwrite', os => os.put({ key: name + '|' + file, name, file, text })).catch(() => {}),
+    // the CRAM itself is too big to keep; its read-check results (plain objects and Maps) are stored instead
+    save: p => p._text && store.on() && store.tx('readwrite', os => os.put({ key: p.name + '|' + p.file, name: p.name, file: p.file, text: p._text, readCheck: p.readCheck })).catch(() => {}),
     remove: (name, file) => store.tx('readwrite', os => os.delete(name + '|' + file)).catch(() => {}),
     clear: () => store.tx('readwrite', os => os.clear()).catch(() => {}),
     all: () => store.tx('readonly', os => os.getAll()).catch(() => []),
@@ -1441,15 +1443,16 @@ if (typeof window !== 'undefined') (() => {
   $('#remember').checked = store.on();
   $('#remember').onchange = e => {
     try { localStorage.setItem('allele.remember', e.target.checked ? '1' : '0'); } catch {}
-    if (e.target.checked) state.people.forEach(p => p._text && store.save(p.name, p.file, p._text));
+    if (e.target.checked) state.people.forEach(store.save);
     else store.clear();
   };
-  function addPerson(name, file, text, data) {
+  function addPerson(name, file, text, data, readCheck) {
     if (state.people.some(p => p.name === name)) name += ` (${state.people.length + 1})`;
     const p = buildPerson(name, file, data, HUES[state.people.length % HUES.length]);
     p._text = text; // kept so it can be saved if "remember" is switched on later
+    p.readCheck = readCheck;
     state.people.push(p);
-    store.save(name, file, text);
+    store.save(p);
   }
 
   async function readFiles(files) {
@@ -1509,7 +1512,7 @@ if (typeof window !== 'undefined') (() => {
   if (store.on()) store.all().then(async saved => {
     for (const x of saved || []) {
       if (state.people.some(p => p.name === x.name && p.file === x.file)) continue;
-      addPerson(x.name, x.file, x.text, parseRaw(x.text));
+      addPerson(x.name, x.file, x.text, parseRaw(x.text), x.readCheck);
     }
     if (saved && saved.length) render();
   });

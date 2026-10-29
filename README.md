@@ -17,7 +17,7 @@ The report can be downloaded as a standalone HTML file or printed / saved as PDF
 - **Ancestry**: share of five 1000 Genomes super-populations; HLA types from tag SNPs.
 - **Family** (Compare): relatedness, shared DNA segments in cM with a chromosome painting, which parent passed on each variant in a trio, and a couple carrier check.
 - **Read check (CRAM)**: confirms variants in the sequencing reads, chromosome dosage and genetic sex; mtDNA and Y haplogroups when the CRAM contains chrM/chrY reads (MyHeritage's do not).
-- **Remember files on this device** (optional) keeps loaded files in the browser's own storage.
+- **Remember files on this device** (optional) keeps loaded files and their read-check results in the browser's own storage (the CRAM itself is not stored; load it again to re-check).
 
 ## Read check (CRAM)
 MyHeritage also offers the sequencing reads as a `.cram` file. Load the person's raw DNA file, then use **Check against reads** (or drop the `.cram` on the page). The app scans the reads in the browser (about 10–15 s for a 1.5 GB file) and shows, for every ClinVar hit and curated marker, whether the reads contain the variant. The CRAM must be aligned to GRCh37, as MyHeritage's are. Reference bases for the checked sites are built in, so no reference genome download is needed.
