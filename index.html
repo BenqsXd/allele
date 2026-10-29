@@ -66,6 +66,8 @@ a { color: inherit; }
 .remove:hover { background: var(--raised); color: var(--text); }
 .initial { flex: none; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-size: 11px; font-weight: 500; color: #1b1b1b; background: hsl(var(--h) 70% 88%); }
 .add { display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 10px; margin-top: 2px; border-radius: var(--radius-control); color: var(--muted); cursor: pointer; transition: background .15s, color .15s; }
+.remember { display: flex; align-items: center; gap: 8px; padding: 6px 10px 0; font-size: var(--fs-small); color: var(--muted); cursor: pointer; }
+.remember input { accent-color: var(--primary); }
 .add:hover { background: var(--raised); color: var(--text); }
 .add svg, .nav svg { width: 16px; height: 16px; flex: none; fill: none; }
 .nav { margin-top: 22px; }
@@ -107,6 +109,34 @@ h2 { margin: 0; font-size: var(--fs-section); line-height: 22px; font-weight: 50
 .readbar .progress { margin: 0; width: 100%; }
 .readbar.bad { border-color: #f3b4ae; }
 .btn:disabled { opacity: .5; cursor: default; }
+/* ancestry, dosage, shared DNA */
+.ancbar { display: flex; height: 18px; border-radius: 4px; overflow: hidden; background: var(--raised); }
+.ancbar i { width: var(--w); background: hsl(var(--h) 55% 52%); transform-origin: left; animation: grow .9s var(--ease) both; }
+.ancbar i + i { box-shadow: inset 2px 0 0 var(--surface); /* taste-skill-ignore: seam, not a shadow */ }
+@keyframes grow { from { transform: scaleX(0); } }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 8px; background: hsl(var(--h) 55% 52%); }
+.dosage { display: grid; grid-template-columns: repeat(auto-fill, minmax(34px, 1fr)); gap: 6px; }
+.dosage span { display: grid; gap: 4px; justify-items: center; font-size: 11px; color: var(--muted); }
+.dosage i { position: relative; width: 100%; height: 40px; border-radius: 3px; background: var(--raised); overflow: hidden; }
+.dosage i u { position: absolute; left: 0; right: 0; bottom: 0; height: calc(var(--v) * 100%); background: #8d939b; transform-origin: bottom; animation: rise .8s var(--ease) both; }
+.dosage i.odd u { background: var(--negative); }
+@keyframes rise { from { transform: scaleY(0); } }
+.dosage b { font-weight: 500; color: var(--text); }
+.pairhead { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin: 14px 0 8px; }
+.pairhead:first-of-type { margin-top: 0; }
+.pairhead .num { color: var(--muted); font-size: var(--fs-small); }
+.pairhead .pill { flex: 0 1 auto; white-space: normal; height: auto; min-height: 22px; padding: 3px 8px; }
+.paint { display: grid; gap: 3px; }
+.chrom { display: grid; grid-template-columns: 22px 1fr; align-items: center; gap: 8px; font-size: 11px; color: var(--muted); }
+.chrom .num { text-align: right; }
+.chrom .bar { position: relative; height: 10px; border-radius: 5px; background: var(--raised); overflow: hidden; }
+.chrom .bar i { position: absolute; top: 0; bottom: 0; background: var(--hue); opacity: .55; }
+.chrom .bar i.ibd2 { opacity: 1; background: #0f3d80; }
+.pgs-rung { cursor: default; }
+.pgs-rung.rough .dot { background: #9aa1aa; }
+.pgs-ladder .ladder-axis, .pgs-ladder .rung { grid-template-columns: 300px minmax(0, 1fr) 52px; }
+.pgs-ladder .rung .name { display: flex; align-items: center; gap: 8px; }
+@media (max-width: 640px) { .pgs-ladder .ladder-axis, .pgs-ladder .rung { grid-template-columns: minmax(0, 1fr) 44px; } }
 .notice { display: flex; gap: 10px; align-items: flex-start; padding: 9px 12px; margin-bottom: var(--gap); border: 1px solid #fde68a; background: var(--pill-warning-bg); color: var(--pill-warning-ink); border-radius: var(--radius-control); font-size: var(--fs-small); line-height: 16px; }
 
 /* stat strip: one card split by hairlines */
@@ -126,7 +156,7 @@ h2 { margin: 0; font-size: var(--fs-section); line-height: 22px; font-weight: 50
 .rung .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rung .pct { text-align: right; font-variant-numeric: tabular-nums; font-weight: 500; }
 .rung .pct.na { color: var(--muted); font-weight: 400; }
-.track { position: relative; height: 22px; }
+.track { position: relative; height: 22px; overflow-x: clip; overflow-clip-margin: 14px; }
 .track::before { content: ""; position: absolute; left: 0; right: 0; top: 10px; height: 2px; background: var(--rule); border-radius: 1px; }
 .track::after { content: ""; position: absolute; left: 50%; top: 3px; bottom: 3px; width: 1px; background: #c9ced5; }
 .track .q { position: absolute; top: 6px; bottom: 6px; width: 0; border-left: 1px dashed #dde1e6; }
@@ -249,8 +279,8 @@ select.search { width: auto; }
 @media (max-width: 640px) {
   :root { --card-pad: 16px; }
   .title-row { flex-direction: column; }
-  .actions { width: 100%; }
-  .actions .btn { flex: 1; }
+  .actions { width: 100%; flex-wrap: wrap; }
+  .actions .btn { flex: 1 1 auto; }
   .ladder-axis, .rung { grid-template-columns: minmax(0, 1fr) 44px; gap: 4px 12px; }
   .ladder-axis > span:first-child { display: none; }
   .ladder-axis .scale { grid-column: 1; }
@@ -294,12 +324,16 @@ select.search { width: auto; }
       <p class="group">People</p>
       <ul class="people" id="people"></ul>
       <label class="add" id="addLabel"><input type="file" id="addFile" accept=".csv,.txt,.tsv" multiple hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>Add a DNA file</label>
+      <label class="remember"><input type="checkbox" id="remember"> Remember files on this device</label>
       <nav class="nav" id="nav" aria-label="Views">
         <p class="group">Report</p>
         <a href="#/overview" data-view="overview"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h10M4 18h13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>Overview</a>
         <a href="#/category" data-view="category"><svg viewBox="0 0 24 24"><path d="M5 19V9M12 19V5M19 19v-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>Categories</a>
         <a href="#/genes" data-view="genes"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="m16 16 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>Gene scan</a>
         <a href="#/traits" data-view="traits"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Z" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>Traits</a>
+        <a href="#/pgs" data-view="pgs"><svg viewBox="0 0 24 24"><path d="M3 18c4 0 5-12 9-12s5 12 9 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>Polygenic scores</a>
+        <a href="#/drugs" data-view="drugs"><svg viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="8" rx="4" fill="none" stroke="currentColor" stroke-width="1.5" transform="rotate(-35 12 12)"/><path d="M9.5 8.5l5 7" stroke="currentColor" stroke-width="1.5"/></svg>Medications</a>
+        <a href="#/ancestry" data-view="ancestry"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M4 12h16M12 4c3 3 3 13 0 16M12 4c-3 3-3 13 0 16" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>Ancestry</a>
         <a href="#/compare" data-view="compare"><svg viewBox="0 0 24 24"><path d="M8 4v16M16 4v16M4 8h8M12 16h8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>Compare</a>
         <p class="group">About</p>
         <a href="#/method" data-view="method"><svg viewBox="0 0 24 24"><path d="M6 4h9l3 3v13H6z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M9 11h6M9 15h6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>Method &amp; sources</a>
@@ -315,7 +349,9 @@ select.search { width: auto; }
 <input type="file" id="cramFile" accept=".cram" hidden>
 
 <script src="db.js"></script>
+<script src="pgx.js"></script>
 <script src="app.js"></script>
+<script src="pgs.js" defer></script>
 <script src="clinvar.js" defer></script>
 </body>
 </html>

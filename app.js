@@ -1,7 +1,7 @@
 'use strict';
 // Allele — offline DNA report. Analysis core first (pure, tested by test.js), then the interface.
 
-const VERSION = '1.0.2';
+const VERSION = '1.1.0';
 const EVF = { strong: 1, moderate: 0.75, limited: 0.5 };
 const SIG = { P: 'Pathogenic', LP: 'Likely pathogenic', RF: 'Risk factor', DR: 'Drug response', PR: 'Protective' };
 const HUES = [205, 25, 145, 330, 85, 265];
@@ -211,6 +211,7 @@ async function runReadCheck(blob, sites, CramFile, BlobFile, onProgress = () => 
   const obs = new Map(sites.map(x => [x.id, {}]));
   const anyIn = (list, lo, hi) => { let a = 0, b = list.length; while (a < b) { const m = (a + b) >> 1; if (list[m].pos < lo) a = m + 1; else b = m; } return a < list.length && list[a].pos <= hi ? a : -1; };
   let containers = 0, decoded = 0, reads = 0;
+  const depth = []; // records per container, for chromosome dosage
   try {
     for await (const c of file.iterContainers()) {
       const h = await c.getHeader();
@@ -218,6 +219,7 @@ async function runReadCheck(blob, sites, CramFile, BlobFile, onProgress = () => 
       onProgress(Math.min(1, h._endPosition / blob.size));
       if (containers === 1) continue; // the first container holds the SAM header
       if (!h.numRecords || h.refSeqId === -1) break; // EOF marker, or the unmapped reads sorted last
+      if (h.refSeqId >= 0) depth.push({ seq: h.refSeqId, start: h.refSeqStart, span: h.alignmentSpan, n: h.numRecords });
       const list = bySeq.get(h.refSeqId);
       if (h.refSeqId >= 0 && (!list || anyIn(list, h.refSeqStart - 1000, h.refSeqStart + h.alignmentSpan + 1000) < 0)) continue;
       decoded++;
@@ -243,7 +245,341 @@ async function runReadCheck(blob, sites, CramFile, BlobFile, onProgress = () => 
     if (!containers) throw err; // reading past the last container is how the walk ends
   }
   onProgress(1);
-  return { obs, containers, decoded, reads };
+  return { obs, containers, decoded, reads, depth, seqNames: sq.map(s => s.SN) };
+}
+
+// ---------- shared helpers ----------
+const COMPLEMENT = { A: 'T', T: 'A', C: 'G', G: 'C' };
+// Copies of allele a in genotype g for a biallelic site a/b, read on either strand; null when g fits neither.
+function dosage(g, a, b) {
+  if ([...g].every(c => c === a || c === b)) return (g[0] === a) + (g[1] === a);
+  const ca = COMPLEMENT[a], cb = COMPLEMENT[b];
+  if (ca !== b && [...g].every(c => c === ca || c === cb)) return (g[0] === ca) + (g[1] === ca);
+  return null;
+}
+// Standard normal cumulative distribution (Abramowitz-Stegun 26.2.17, error < 7.5e-8).
+function normCdf(z) {
+  const t = 1 / (1 + 0.2316419 * Math.abs(z));
+  const d = 0.3989423 * Math.exp(-z * z / 2);
+  const p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+  return z > 0 ? 1 - p : p;
+}
+function inferSex(geno) {
+  let x = 0, het = 0;
+  for (const r of geno.values()) if (r.chr === 'X' || r.chr === '23') { x++; if (r.g[0] !== r.g[1]) het++; }
+  if (x < 1000) return null;
+  return het / x < 0.01 ? 'male' : het / x > 0.08 ? 'female' : null;
+}
+
+// ---------- polygenic scores ----------
+// Each variant: [rsID, effect allele, other allele, weight, effect-allele frequency in Europeans, GRCh37 chr:pos].
+// The person's score is centred on the European mean and scaled by its standard deviation (Hardy-Weinberg,
+// independent variants), using only the variants found in the file; missing variants count as average.
+function scorePGS(geno, score) {
+  let dev = 0, v = 0, used = 0;
+  for (const [rs, ea, oa, w, p, pk] of score.variants) {
+    const r = geno.get(rs) || (pk && geno.get(pk));
+    if (!r) continue;
+    const d = dosage(r.g, ea, oa);
+    if (d === null) continue;
+    used++;
+    dev += w * (d - 2 * p);
+    v += w * w * 2 * p * (1 - p);
+  }
+  const z = v > 0 ? dev / Math.sqrt(v) : 0;
+  return { z, pct: normCdf(z) * 100, used, total: score.total, coverage: used / score.total };
+}
+
+// ---------- ancestry (supervised admixture against 1000 Genomes super-populations) ----------
+// POP_FREQS[rs] = [allele1, allele2, freq of allele1 in each of POP_NAMES]. EM over the mixture proportions.
+function admixture(geno, freqs, pops, iterations = 100) {
+  const obs = [];
+  for (const rs in freqs) {
+    const r = geno.get(rs);
+    if (!r) continue;
+    const [a, b, ...f] = freqs[rs];
+    const d = dosage(r.g, a, b);
+    if (d !== null) obs.push([d, f.map(x => Math.min(0.999, Math.max(0.001, x)))]);
+  }
+  const K = pops.length;
+  let q = new Array(K).fill(1 / K);
+  // EM converges slowly from an even start: warm up on every 8th SNP, then refine on all of them
+  const sample = obs.filter((_, i) => i % 8 === 0);
+  for (let it = 0; it < iterations * 3 + iterations; it++) {
+    const set = it < iterations * 3 ? sample : obs;
+    const acc = new Array(K).fill(0);
+    let n = 0;
+    for (const [d, f] of set) {
+      for (const [copies, useA] of [[d, true], [2 - d, false]]) {
+        if (!copies) continue;
+        let s = 0;
+        const r = f.map((x, k) => { const v = q[k] * (useA ? x : 1 - x); s += v; return v; });
+        for (let k = 0; k < K; k++) acc[k] += copies * r[k] / s;
+        n += copies;
+      }
+    }
+    q = acc.map(x => x / n);
+  }
+  return { snps: obs.length, props: pops.map((p, k) => [p, q[k]]).sort((x, y) => y[1] - x[1]) };
+}
+
+// ---------- pharmacogenomics ----------
+function pgxCall(gene, geno, sex, mt) {
+  const found = [], missing = [];
+  let counts = {};
+  for (const v of gene.variants) {
+    if (v.pos) { // mitochondrial, from CRAM
+      if (!mt) { missing.push(v.name); continue; }
+      const b = mt.consensus[v.pos];
+      if (!b) { missing.push(v.name); continue; }
+      counts[v.name] = b === v.alt ? 2 : 0;
+      continue;
+    }
+    let r = geno.get(v.id), alt = v.alt, via = null;
+    if (!r && v.proxy) { r = geno.get(v.proxy.id); alt = v.proxy.alt; via = v.proxy.id; }
+    if (!r) { missing.push(`${v.name} (${v.id})`); continue; }
+    const k = [...r.g].filter(c => c === alt).length;
+    counts[v.id] = k;
+    found.push({ ...v, g: r.g, k, via });
+  }
+  const tested = gene.variants.length - missing.length;
+  if (!tested) return { gene: gene.gene, phenotype: null, found, missing, status: 'Not tested' };
+  const c = id => counts[id] || 0;
+  let phenotype, activity;
+  if (gene.kind === 'cyp2c19') {
+    const none = c('rs4244285') + c('rs4986893'), inc = c('rs12248560');
+    phenotype = none >= 2 ? 'Poor metabolizer' : none === 1 ? 'Intermediate metabolizer' : inc === 2 ? 'Ultrarapid metabolizer' : inc === 1 ? 'Rapid metabolizer' : 'Normal metabolizer';
+  } else if (gene.kind === 'activity') {
+    activity = 2;
+    for (const v of gene.variants) {
+      let k = c(v.id);
+      if (v.notWith) k = Math.max(0, k - c(v.notWith)); // the *4 haplotype also carries this change
+      activity -= k * (1 - v.value);
+    }
+    activity = Math.max(0, activity);
+    phenotype = gene.bands.find(([min]) => activity >= min - 1e-9)[1];
+  } else if (gene.kind === 'expresser') {
+    const functional = Math.max(0, 2 - gene.variants.reduce((s, v) => s + c(v.id), 0));
+    phenotype = gene.phenotype[2 - functional];
+  } else if (gene.kind === 'mito') {
+    phenotype = gene.phenotype[Object.values(counts).some(k => k > 0) ? 1 : 0];
+  } else {
+    let n = gene.variants.reduce((s, v) => s + c(v.id), 0);
+    if (gene.cis && gene.cis.every(id => c(id) > 0)) n -= Math.min(...gene.cis.map(c)); // *3A: both changes on one allele
+    if (gene.xlinked && sex === 'male' && n > 0) n = 2;
+    phenotype = gene.phenotype[Math.min(2, n)];
+  }
+  return { gene: gene.gene, phenotype, activity, found, missing, status: missing.length ? 'Partly tested' : 'Tested' };
+}
+function pgxReport(geno, sex, mt) {
+  const calls = PGX_GENES.map(g => pgxCall(g, geno, sex, mt));
+  const p = {};
+  for (const x of calls) { if (x.phenotype) p[x.gene] = x.phenotype; if (x.activity !== undefined) p[x.gene + '_AS'] = x.activity; }
+  const drugs = PGX_DRUGS.map(d => {
+    const ready = d.genes.every(g => p[g] !== undefined);
+    const [action, advice] = ready ? d.rule(p) : ['unknown', `Not determined: ${d.genes.filter(g => p[g] === undefined).join(', ')} not tested in this file.`];
+    return { ...d, action, advice };
+  });
+  return { calls, drugs };
+}
+
+// ---------- family: shared DNA segments ----------
+// Sex-averaged genetic map lengths (cM, HapMap/deCODE) and GRCh37 lengths (bp): cM per bp is scaled per chromosome.
+const CM = [0, 278, 263, 224, 214, 209, 193, 187, 170, 168, 172, 160, 169, 126, 116, 128, 133, 129, 124, 110, 108, 62, 73];
+const BP = [0, 249250621, 243199373, 198022430, 191154276, 180915260, 171115067, 159138663, 146364022, 141213431, 135534747, 135006516, 133851895, 115169878, 107349540, 102531392, 90354753, 81195210, 78077248, 59128983, 63025520, 48129895, 51304566];
+const cmOf = (chr, bp) => bp * CM[chr] / BP[chr];
+
+// Half-identical segments: stretches with no opposite homozygote (AA vs BB). An isolated opposite homozygote
+// (none within 100 SNPs either side) is treated as a genotyping error. Fully identical (IBD2) runs likewise.
+function sharedSegments(a, b, minCM = 7, minSnps = 500) {
+  const byChr = new Map();
+  for (const [id, r] of a) {
+    const chr = +r.chr;
+    if (!(chr >= 1 && chr <= 22)) continue;
+    const s = b.get(id);
+    if (!s) continue;
+    const x = r.g, y = s.g;
+    const opp = x[0] === x[1] && y[0] === y[1] && x[0] !== y[0];
+    const same = (x[0] === y[0] && x[1] === y[1]) || (x[0] === y[1] && x[1] === y[0]);
+    if (!byChr.has(chr)) byChr.set(chr, []);
+    byChr.get(chr).push([r.pos, opp, same]);
+  }
+  const half = [], full = [];
+  const runs = (snps, breakAt, out, chr, minLen, minN) => {
+    const br = [];
+    snps.forEach((s, i) => { if (breakAt(s)) br.push(i); });
+    // a real boundary has several mismatches close together; 1-2 within 200 SNPs are genotyping errors
+    const keep = br.filter((x, j) => { let n = 0; for (let i = j - 1; i >= 0 && x - br[i] <= 100; i--) n++; for (let i = j + 1; i < br.length && br[i] - x <= 100; i++) n++; return n >= 2; });
+    let start = 0;
+    for (const end of [...keep, snps.length]) {
+      if (end - start >= minN) {
+        const cm = cmOf(chr, snps[end - 1][0]) - cmOf(chr, snps[start][0]);
+        if (cm >= minLen) out.push({ chr, start: snps[start][0], end: snps[end - 1][0], cm, snps: end - start });
+      }
+      start = end + 1;
+    }
+  };
+  for (const [chr, snps] of byChr) {
+    snps.sort((p, q) => p[0] - q[0]);
+    runs(snps, s => s[1], half, chr, minCM, minSnps);
+    runs(snps, s => !s[2], full, chr, 2, 200);
+  }
+  const sum = xs => xs.reduce((t, s) => t + s.cm, 0);
+  return { half, full, total: sum(half), full2: sum(full), largest: half.reduce((m, s) => Math.max(m, s.cm), 0) };
+}
+// Relationship from shared cM (ranges after the Shared cM Project) and fully identical DNA.
+function cmReading(seg) {
+  const t = seg.total, f = seg.full2;
+  if (t > 3300) return f > 2400 ? 'Same person or identical twin' : f > 300 ? 'Full siblings' : 'Parent and child';
+  if (t > 1300) return 'Grandparent, aunt or uncle, or half-sibling';
+  if (t > 550) return 'First cousin or similar';
+  if (t > 200) return 'Second cousin or similar';
+  if (t > 120) return 'Possibly a third cousin';
+  return 'No close relationship detected (short shared segments are common within one population)';
+}
+// Which parent passed on each allele at a site, for a child with two parents. null when it can't be told.
+function originAt(c, m, f) {
+  if (!c || !m || !f) return null;
+  const has = (g, x) => g.includes(x);
+  const [x, y] = c;
+  if (x === y) return has(m, x) && has(f, x) ? { [x]: 'both' } : null;
+  if (has(m, x) && !has(m, y) && has(f, y)) return { [x]: 'mother', [y]: 'father' };
+  if (has(m, y) && !has(m, x) && has(f, x)) return { [y]: 'mother', [x]: 'father' };
+  if (has(f, x) && !has(f, y) && has(m, y)) return { [x]: 'father', [y]: 'mother' };
+  if (has(f, y) && !has(f, x) && has(m, x)) return { [y]: 'father', [x]: 'mother' };
+  return null;
+}
+function mendelErrors(c, m, f) {
+  let n = 0, err = 0;
+  for (const [id, r] of c) {
+    const a = m.get(id), b = f.get(id);
+    if (!a || !b || r.chr === 'X' || r.chr === 'Y') continue;
+    n++;
+    const g = r.g;
+    if (!((a.g.includes(g[0]) && b.g.includes(g[1])) || (a.g.includes(g[1]) && b.g.includes(g[0])))) err++;
+  }
+  return { n, err };
+}
+
+// ---------- carrier status from inheritance mode ----------
+function carrierStatus(hit, moi, sex) {
+  const m = moi || '';
+  if (!m) return { key: 'unknown', label: 'Inheritance not curated' };
+  if (/AD|XLD/.test(m) && !/AR/.test(m)) return { key: 'dominant', label: 'Dominant: one copy can cause it' };
+  if (/XL/.test(m) && sex === 'male') return { key: 'affected', label: 'X-linked, male: one copy is enough' };
+  if (hit.k === 2) return { key: 'affected', label: 'Two copies: condition possible' };
+  if (/AD/.test(m)) return { key: 'dominant', label: 'Dominant or recessive forms' };
+  return { key: 'carrier', label: 'Carrier: usually no effect' };
+}
+
+// ---------- CRAM-derived: mtDNA and Y haplogroups, chromosome dosage ----------
+const MT_SKIP = new Set([309, 310, 315, 316, 523, 524, 3107, 16182, 16183, 16193, 16519]);
+function mtConsensus(obs, minDepth = 3) {
+  const consensus = {}, polys = [];
+  let covered = 0;
+  for (let pos = 1; pos <= 16569; pos++) {
+    const o = obs.get('MT:' + pos);
+    if (!o) continue;
+    const depth = Object.values(o).reduce((s, n) => s + n, 0);
+    if (depth < minDepth) continue;
+    const [base, n] = Object.entries(o).sort((x, y) => y[1] - x[1])[0];
+    if (n / depth < 0.7) continue;
+    covered++;
+    consensus[pos] = base;
+    if (base !== MT_REF[pos - 1] && !MT_SKIP.has(pos)) polys.push(pos + base);
+  }
+  return { consensus, polys, covered };
+}
+// HaploGrep-style: compare the sample's differences from rCRS with each haplogroup's expected differences
+// (cumulative along the rCRS-rooted PhyloTree), on covered positions, weighted by phylogenetic stability.
+function mtHaplogroup(mt, tree, weights, ref) {
+  const w = k => weights[k] || 1;
+  const sample = new Set(mt.polys);
+  const sampleW = mt.polys.reduce((s, k) => s + w(k), 0);
+  const profile = new Map(); // pos -> base, relative to rCRS
+  const children = tree.map(() => []);
+  tree.forEach((n, i) => { if (n[1] >= 0) children[n[1]].push(i); });
+  let best = { score: -1 };
+  const visit = (i, depth) => {
+    const changed = [];
+    for (const p of tree[i][2] ? tree[i][2].split(' ') : []) {
+      const m = /^(\d+)([ACGT])/.exec(p);
+      const pos = +m[1];
+      changed.push([pos, profile.get(pos)]);
+      if (m[2] === ref[pos - 1]) profile.delete(pos); else profile.set(pos, m[2]);
+    }
+    let expW = 0, hitW = 0, miss = [];
+    for (const [pos, base] of profile) {
+      if (MT_SKIP.has(pos) || !mt.consensus[pos]) continue;
+      const k = pos + base;
+      expW += w(k);
+      if (sample.has(k)) hitW += w(k); else miss.push(k);
+    }
+    const score = expW && sampleW ? 0.5 * (hitW / expW + hitW / sampleW) : 0;
+    if (score > best.score + 1e-9 || (Math.abs(score - best.score) < 1e-9 && depth > best.depth)) best = { name: tree[i][0], score, depth, missing: miss };
+    for (const c of children[i]) visit(c, depth + 1);
+    for (const [pos, old] of changed.reverse()) { if (old === undefined) profile.delete(pos); else profile.set(pos, old); }
+  };
+  tree.forEach((n, i) => { if (n[1] < 0) visit(i, 0); });
+  return { ...best, private: mt.polys.length };
+}
+// Y: derived calls vote for their ISOGG haplogroup and its ancestors (same letter, by name prefix);
+// ancestral calls on the chosen branch count against it.
+function yHaplogroup(obs, snps) {
+  const derived = [], ancestral = [];
+  for (const [pos, anc, der, hap, name] of snps) {
+    const o = obs.get('Y:' + pos);
+    if (!o) continue;
+    const [base] = Object.entries(o).sort((x, y) => y[1] - x[1])[0] || [];
+    if (base === der) derived.push({ hap, name, pos });
+    else if (base === anc) ancestral.push({ hap, name, pos });
+  }
+  if (!derived.length) return { name: null, derived: 0, ancestral: ancestral.length };
+  let best = null;
+  for (const cand of new Set(derived.map(d => d.hap))) {
+    const support = derived.filter(d => cand.startsWith(d.hap)).length;
+    const conflict = ancestral.filter(a => cand.startsWith(a.hap)).length;
+    const score = support - 3 * conflict;
+    if (!best || score > best.score || (score === best.score && cand.length > best.name.length)) best = { name: cand, score, support, conflict };
+  }
+  const markers = derived.filter(d => best.name.startsWith(d.hap)).sort((a, b) => b.hap.length - a.hap.length).slice(0, 4).map(d => d.name);
+  return { ...best, markers, derived: derived.length, ancestral: ancestral.length };
+}
+// Centromeres, heterochromatin and acrocentric short arms (GRCh37, Mb): read depth there is unreliable.
+const HARD_REGIONS = { 1: [120, 146], 2: [89, 98], 3: [88, 95], 4: [48, 54], 5: [45, 51], 6: [57, 64], 7: [56, 63], 8: [43, 48], 9: [38, 71], 10: [38, 43], 11: [50, 56], 12: [33, 39], 13: [0, 20], 14: [0, 20], 15: [0, 21], 16: [34, 47], 17: [21, 26], 18: [14, 19], 19: [23, 29], 20: [25, 30], 21: [0, 15], 22: [0, 17] };
+// Read density per chromosome from CRAM container headers, relative to the autosomal median.
+function chromosomeDosage(depth, names) {
+  const per = new Map();
+  for (const d of depth) {
+    const chr = (names[d.seq] || '').replace(/^chr/i, '');
+    if (!/^([0-9]{1,2}|X|Y)$/.test(chr)) continue;
+    const x = per.get(chr) || { reads: 0, span: 0, bins: new Map() };
+    x.reads += d.n; x.span += d.span;
+    const bin = Math.floor(d.start / 1e7);
+    const b = x.bins.get(bin) || { reads: 0, span: 0 };
+    b.reads += d.n; b.span += d.span;
+    x.bins.set(bin, b);
+    per.set(chr, x);
+  }
+  const dens = c => per.has(c) && per.get(c).span ? per.get(c).reads / per.get(c).span : 0;
+  const auto = [...Array(22)].map((_, i) => dens(String(i + 1))).filter(Boolean).sort((a, b) => a - b);
+  const median = auto[Math.floor(auto.length / 2)] || 1;
+  const rows = [...per.keys()].sort((a, b) => (+a || (a === 'X' ? 23 : 24)) - (+b || (b === 'X' ? 23 : 24))).map(c => ({ chr: c, ratio: dens(c) / median }));
+  const xr = dens('X') / median, yr = dens('Y') / median, hasY = per.has('Y'), hasMT = per.has('MT') || per.has('M');
+  // Without any Y alignments in the file (some providers remove them), X dosage alone tells the sex
+  const sex = hasY ? (xr > 0.8 && yr < 0.15 ? 'female' : xr < 0.7 && yr > 0.15 ? 'male' : null) : (xr > 0.85 ? 'female' : xr < 0.7 ? 'male' : null);
+  const flags = [];
+  for (const [c, x] of per) {
+    if (!/^\d+$/.test(c)) continue;
+    const hard = HARD_REGIONS[c] || [-1, -1];
+    const bins = [...x.bins].filter(([bin, b]) => b.span > 3e6 && !(bin * 10 < hard[1] && bin * 10 + 10 > hard[0])).map(([bin, b]) => [bin, b.reads / b.span / median]).sort((p, q) => p[0] - q[0]);
+    for (let i = 0; i + 1 < bins.length; i++) {
+      const [b1, r1] = bins[i], [b2, r2] = bins[i + 1];
+      if (b2 === b1 + 1 && ((r1 < 0.6 && r2 < 0.6) || (r1 > 1.4 && r2 > 1.4)))
+        flags.push({ chr: c, start: b1 * 10, end: (b2 + 1) * 10, ratio: (r1 + r2) / 2 });
+    }
+  }
+  return { rows, xr, yr, sex, flags, hasY, hasMT };
 }
 
 function personName(file) {
@@ -268,8 +604,25 @@ function buildPerson(name, file, data, hue) {
     }
   }
   p.notable.sort((x, y) => x.val - y.val);
+  p.sex = inferSex(data.geno);
+  // Lookup by rsID, or by "chr:pos" for score variants published without an rsID
+  let byPos = null;
+  p.lookup = { get: id => id[0] === 'r' ? data.geno.get(id) : (byPos ??= new Map([...data.geno.values()].map(r => [`${r.chr}:${r.pos}`, r]))).get(id) };
   refreshClinvar(p);
   return p;
+}
+// Results that need the optional data files; computed on first use and cached on the person.
+function pgsResults(p) {
+  if (typeof PGS_SCORES === 'undefined') return null;
+  return p._pgs ??= PGS_SCORES.map(s => ({ score: s, ...scorePGS(p.lookup, s) }));
+}
+function ancestryResult(p) {
+  if (typeof POP_FREQS === 'undefined') return null;
+  return p._anc ??= admixture(p.lookup, POP_FREQS, POP_NAMES);
+}
+function pgxResult(p) {
+  if (typeof PGX_GENES === 'undefined') return null;
+  return p._pgx ??= pgxReport(p.geno, p.sex, p.readCheck && p.readCheck.mt);
 }
 function refreshClinvar(p) {
   p.hits = clinvarHits(p.geno);
@@ -489,6 +842,13 @@ if (typeof window !== 'undefined') (() => {
     const eye = g('rs12913832'); if (eye) rows.push(['Eye colour', ['Brown likely', 'Brown, hazel or green', 'Blue or light likely'][eye.r.k]]);
     const fv = g('rs6025'); if (fv) rows.push(['Factor V Leiden', fv.r.k ? (fv.r.k === 1 ? 'Heterozygous' : 'Homozygous') : 'Not carried']);
     rows.push(['ClinVar pathogenic', p.plp.length ? `${p.plp.length} carried` : 'None found']);
+    if (p.sex) rows.push(['Genetic sex', p.sex === 'male' ? 'Male (XY)' : 'Female (XX)']);
+    const a = p._anc; // shown once computed on the Ancestry page (it takes a second)
+    if (a) rows.push(['Ancestry', a.props.filter(([, v]) => v >= 0.05).map(([k, v]) => `${POP_LABEL[k]} ${Math.round(v * 100)}%`).join(', ')]);
+    if (p.readCheck && p.readCheck.mtHap) rows.push(['mtDNA haplogroup', p.readCheck.mtHap.name || '—']);
+    if (p.readCheck && p.readCheck.yHap && p.readCheck.yHap.name) rows.push(['Y haplogroup', p.readCheck.yHap.name]);
+    const x = pgxResult(p);
+    if (x) rows.push(['Medicines to review', String(x.drugs.filter(d => d.action === 'adjust' || d.action === 'avoid').length)]);
     return `<dl class="kv">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('')}</dl>`;
   }
 
@@ -547,8 +907,23 @@ if (typeof window !== 'undefined') (() => {
       <td>${gtCells(x.g, x.alt)}<span class="gt-note">${x.ref}&gt;${x.alt} · ${x.k === 2 ? 'two copies' : 'one copy'}</span></td>
       <td class="effect">${esc(x.cond)}</td>
       <td class="num" aria-label="${x.stars} of 4 review stars">${x.stars ? `${x.stars} of 4` : '—'}</td>
-      <td><span class="pill ${x.sig === 'P' || x.sig === 'LP' ? 'bad' : x.sig === 'RF' ? 'warn' : x.sig === 'PR' ? 'good' : ''}">${SIG[x.sig]}</span></td>${readsTd(x.id, x.g)}
+      <td><span class="pill ${x.sig === 'P' || x.sig === 'LP' ? 'bad' : x.sig === 'RF' ? 'warn' : x.sig === 'PR' ? 'good' : ''}">${SIG[x.sig]}</span>${inheritNote(x)}</td>${readsTd(x.id, x.g)}
       <td class="src"><a href="https://www.ncbi.nlm.nih.gov/clinvar/variation/${x.vid}/" target="_blank" rel="noopener">ClinVar ${x.vid}</a>${links(null, x.id)}</td></tr>`).join('');
+  }
+  const MOI_WORD = { AR: 'recessive', AD: 'dominant', XL: 'X-linked', XLD: 'X-linked dominant', MT: 'mitochondrial', YL: 'Y-linked' };
+  const moiOf = gene => typeof GENE_MOI !== 'undefined' && gene ? GENE_MOI[gene] : '';
+  function inheritNote(x) {
+    if (x.sig !== 'P' && x.sig !== 'LP') return '';
+    const m = moiOf(x.gene), c = carrierStatus(x, m, rp().sex);
+    return `<span class="gt-note" style="white-space:normal">${m ? m.split('/').map(k => MOI_WORD[k] || k).join(' or ') + ' · ' : ''}${esc(c.label)}</span>`;
+  }
+  function carrierSummary(p) {
+    if (!p.plp.length) return '';
+    const by = { carrier: [], dominant: [], affected: [], unknown: [] };
+    for (const h of p.plp) by[carrierStatus(h, moiOf(h.gene), p.sex).key].push(h);
+    const line = (k, label) => by[k].length ? `<li><span>${label}</span><span class="num">${by[k].length}</span><span class="meta">${by[k].map(h => esc(h.gene || h.id)).join(', ')}</span></li>` : '';
+    return `<section class="card" style="margin-bottom:var(--gap)" aria-labelledby="h-carrier"><div class="card-head"><h2 id="h-carrier">Carrier screening</h2><span class="small muted">pathogenic variants by inheritance (GenCC)</span></div>
+      <ul class="list">${line('carrier', 'Carrier of a recessive condition (one copy, usually no effect)')}${line('affected', 'Enough copies to be affected: confirm clinically')}${line('dominant', 'Dominant condition: one copy can be enough')}${line('unknown', 'Inheritance not curated')}</ul></section>`;
   }
   const cvHead = () => `<table class="rows"><thead><tr><th>Gene</th><th>Genotype</th><th>Condition or drug</th><th class="num">Review</th><th>Classification</th>${readsTh()}<th>Sources</th></tr></thead><tbody>`;
   function cvFiltered(p) {
@@ -561,6 +936,7 @@ if (typeof window !== 'undefined') (() => {
     return `<div class="view">
       ${titleRow('Gene scan', `Every SNP in ${esc(p.name)}’s file checked against NCBI ClinVar (${esc(CLINVAR_DATE)}, ${fmt(Object.keys(CLINVAR).length)} classified variants). Listed: variants where the classified allele is carried.`, p.plp.length ? `${p.plp.length} pathogenic or likely pathogenic, ${p.plp.filter(h => h.k === 1).length} of them as a single copy. For recessive conditions one copy means carrier status only.` : 'No pathogenic or likely pathogenic variants carried.', true, true)}
       ${readNotice(p)}${lowPass(p)}
+      ${carrierSummary(p)}
       <section class="card" aria-labelledby="h-cv">
         <div class="card-head"><h2 id="h-cv">Variants carried</h2><span class="small muted num" id="cvCount"></span></div>
         <div class="toolbar"><div class="seg" role="group" aria-label="Classification">${segs}</div>
@@ -578,7 +954,193 @@ if (typeof window !== 'undefined') (() => {
   function viewTraits(p) {
     const traits = p.found.filter(f => !Object.keys(f.e.cats).length);
     return `<div class="view">${titleRow('Traits', 'Characteristics with no better or worse genotype. Not scored.', '')}
-      <section class="card"><div class="tablewrap">${traits.length ? markerHead().replace('<th>Impact</th>', '<th></th>') + traits.map(f => markerRow(f)).join('') + '</tbody></table>' : '<p class="empty">None of the trait markers are in this file.</p>'}</div></section></div>`;
+      <section class="card"><div class="tablewrap">${traits.length ? markerHead().replace('<th>Impact</th>', '<th></th>') + traits.map(f => markerRow(f)).join('') + '</tbody></table>' : '<p class="empty">None of the trait markers are in this file.</p>'}</div></section>
+      ${hlaCard(p)}</div>`;
+  }
+
+  // ---------- polygenic scores ----------
+  const POP_LABEL = { EUR: 'European', AFR: 'African', EAS: 'East Asian', SAS: 'South Asian', AMR: 'Admixed American' };
+  const ordinal = n => { if (n < 1) return 'below 1st'; if (n > 99) return 'above 99th'; const r = Math.round(n), s = ['th', 'st', 'nd', 'rd'], v = r % 100; return r + (s[(v - 20) % 10] || s[v] || s[0]); };
+  const pctShort = n => n < 1 ? '<1' : n > 99 ? '>99' : String(Math.round(n));
+  const FEW = 0.25; // under a quarter of a score's variants in the file: the percentile is only a rough guide
+  function pgsBand(r) {
+    const q = r.pct, unit = r.score.unit;
+    if (unit) return { cls: '', text: q >= 50 ? `${unit[0].toUpperCase() + unit.slice(1)} than ${Math.round(q)}%` : `Lower than ${Math.round(100 - q)}%` };
+    if (q >= 90) return { cls: 'bad', text: 'High' };
+    if (q >= 75) return { cls: 'warn', text: 'Above average' };
+    if (q <= 10) return { cls: 'good', text: 'Low' };
+    if (q <= 25) return { cls: 'good', text: 'Below average' };
+    return { cls: '', text: 'Average' };
+  }
+  function pgsRows(results, opts = {}) {
+    return `<div class="ladder pgs-ladder${opts.static ? ' on' : ''}"><div class="ladder-axis"><span></span><span class="scale"><span>lowest</span><span>average</span><span>highest</span></span><span class="num" style="text-align:right">percentile</span></div>
+      ${results.map(r => { const b = pgsBand(r); return `<div class="rung pgs-rung${r.coverage < FEW ? ' rough' : ''}" tabindex="0" title="${esc(r.score.desc)} · ${r.used} of ${r.total} variants found">
+        <span class="name">${esc(r.score.name)}${r.coverage < FEW ? ' <span class="pill">few variants</span>' : ''}</span>
+        <span class="track">${[25, 75].map(q => `<span class="q" style="left:${q}%"></span>`).join('')}<span class="slide" style="--to:${r.pct.toFixed(1)}%"><span class="dot"></span></span></span>
+        <span class="pct${r.coverage < FEW ? ' na' : ''}">${pctShort(r.pct)}</span></div>`; }).join('')}</div>`;
+  }
+  function pgsTable(results) {
+    return `<table class="rows"><thead><tr><th>Trait</th><th class="num">Percentile</th><th>Reading</th><th class="num">Variants used</th><th>Source</th></tr></thead><tbody>
+      ${results.map(r => { const b = pgsBand(r); return `<tr><td><b>${esc(r.score.name)}</b><span class="id" style="font-family:var(--font)">${esc(r.score.desc)}</span></td>
+        <td class="num">${ordinal(r.pct)}</td><td><span class="pill ${r.coverage < FEW ? '' : b.cls}">${esc(b.text)}</span>${r.coverage < FEW ? '<span class="gt-note">rough: few of its variants are in this file</span>' : ''}</td>
+        <td class="num">${fmt(r.used)} <span class="muted">of ${fmt(r.total)}</span></td>
+        <td class="src"><a href="https://www.pgscatalog.org/score/${r.score.id}/" target="_blank" rel="noopener">${r.score.id}</a>${r.score.pmid ? `<br>${esc(r.score.pmid.slice(0, 60))}` : ''}</td></tr>`; }).join('')}</tbody></table>`;
+  }
+  function viewPGS(p) {
+    const res = pgsResults(p);
+    if (!res) return `<div class="view">${titleRow('Polygenic scores', '', '', false)}<p class="empty">pgs.js is missing. Run <code>python build_data.py</code> next to index.html.</p></div>`;
+    const anc = ancestryResult(p), eur = anc ? (anc.props.find(x => x[0] === 'EUR') || [0, 0])[1] : 1;
+    const disease = res.filter(r => !r.score.unit).sort((a, b) => b.pct - a.pct), quant = res.filter(r => r.score.unit);
+    const top = disease.filter(r => r.pct >= 90 && r.coverage >= FEW);
+    return `<div class="view">
+      ${titleRow('Polygenic scores', `${res.length} published scores from the PGS Catalog, each combining many variants. The percentile places ${esc(p.name)} among people of European ancestry (1000 Genomes).`, top.length ? `In the top 10% for ${top.map(r => esc(r.score.name)).join(', ')}.` : 'No disease score with good coverage is in the top 10%.', true)}
+      ${eur < 0.8 ? `<div class="notice" role="note"><span>The ancestry estimate is ${Math.round(eur * 100)}% European. Percentiles use a European reference, so they are less reliable for this genome.</span></div>` : ''}
+      <div class="notice" role="note"><span>A percentile shows genetic tendency relative to others, not a diagnosis: most people in the top 10% never develop the disease, and lifestyle, age and family history often matter more. MyHeritage files contain about 585,000 SNPs, so many scores can use only part of their variants; scores marked “few variants” use under a quarter and are rough.</span></div>
+      <section class="card" aria-labelledby="h-pgsd"><div class="card-head"><h2 id="h-pgsd">Disease risk</h2><span class="small muted">dot = percentile among Europeans</span></div>${pgsRows(disease)}</section>
+      <section class="card" style="margin-top:var(--gap)" aria-labelledby="h-pgsq"><div class="card-head"><h2 id="h-pgsq">Measured traits</h2></div>${pgsRows(quant)}
+        <p class="small muted" style="margin:12px 0 0">Measured traits show where the genetic score sits; actual height, BMI, blood pressure or cholesterol also depend on diet, activity and age.</p></section>
+      <section class="card" style="margin-top:var(--gap)" aria-labelledby="h-pgst"><div class="card-head"><h2 id="h-pgst">All scores</h2></div><div class="tablewrap">${pgsTable([...disease, ...quant])}</div></section>
+    </div>`;
+  }
+
+  // ---------- medications ----------
+  const ACTION = { standard: ['', 'Standard'], adjust: ['warn', 'Adjust'], avoid: ['bad', 'Avoid or change'], unknown: ['', 'Not determined'] };
+  function drugTables(x) {
+    return `<section class="card" aria-labelledby="h-genes"><div class="card-head"><h2 id="h-genes">Genes</h2><span class="small muted">${x.calls.filter(c => c.phenotype).length} of ${x.calls.length} tested</span></div><div class="tablewrap">
+      <table class="rows"><thead><tr><th>Gene</th><th>Variants found</th><th>Result</th><th>Guideline</th></tr></thead><tbody>
+      ${x.calls.map(c => { const g = PGX_GENES.find(g => g.gene === c.gene); const odd = c.phenotype && !/^(Normal|Not carried)/.test(c.phenotype);
+        return `<tr><td class="gene"><b>${esc(c.gene)}</b></td>
+        <td>${c.found.filter(f => f.k).map(f => `${esc(f.name)} ${gtCells(f.g, f.via ? f.proxy.alt : f.alt)}`).join(' ') || '<span class="muted">none of the tested variants</span>'}
+          ${c.missing.length ? `<span class="gt-note">not in file: ${esc(c.missing.join(', '))}</span>` : ''}</td>
+        <td>${c.phenotype ? `<span class="pill ${odd ? 'warn' : ''}">${esc(c.phenotype)}</span>${c.missing.length ? '<span class="gt-note">partly tested: a missing variant could change this</span>' : ''}` : '<span class="muted">Not tested</span>'}${g.note ? `<span class="gt-note" style="white-space:normal">${esc(g.note)}</span>` : ''}</td>
+        <td class="src">${esc(g.ref)}</td></tr>`; }).join('')}</tbody></table></div></section>
+      <section class="card" style="margin-top:var(--gap)" aria-labelledby="h-drugs"><div class="card-head"><h2 id="h-drugs">Medicines</h2><span class="small muted">${x.drugs.filter(d => d.action === 'adjust' || d.action === 'avoid').length} need attention</span></div><div class="tablewrap">
+      <table class="rows"><thead><tr><th>Medicine</th><th>Used for</th><th>Gene</th><th>Guidance</th></tr></thead><tbody>
+      ${[...x.drugs].sort((a, b) => ['avoid', 'adjust', 'standard', 'unknown'].indexOf(a.action) - ['avoid', 'adjust', 'standard', 'unknown'].indexOf(b.action)).map(d => `<tr><td><b>${esc(d.drug)}</b></td><td>${esc(d.area)}</td><td class="mono small">${esc(d.genes.join(', '))}</td>
+        <td><span class="pill ${ACTION[d.action][0]}">${ACTION[d.action][1]}</span><span class="gt-note" style="white-space:normal;max-width:60ch">${esc(d.advice)}</span></td></tr>`).join('')}</tbody></table></div></section>`;
+  }
+  function viewDrugs(p) {
+    const x = pgxResult(p);
+    if (!x) return `<div class="view">${titleRow('Medications', '', '', false)}<p class="empty">pgx.js is missing.</p></div>`;
+    const flag = x.drugs.filter(d => d.action === 'avoid' || d.action === 'adjust');
+    return `<div class="view">
+      ${titleRow('Medications', `Drug-response genes read from ${esc(p.name)}’s file and translated into dosing guidance from CPIC (and DPWG where CPIC has none).`, flag.length ? `${flag.length} medicine group${flag.length > 1 ? 's' : ''} may need a different dose or drug: ${flag.slice(0, 4).map(d => esc(d.drug)).join('; ')}${flag.length > 4 ? '…' : ''}.` : 'No medicine needs a change based on the tested variants.', true, true)}
+      ${readNotice(p)}
+      <div class="notice" role="note"><span>Only common variants are tested, and imputed data can be wrong. Never change a medicine yourself: show this to a doctor or pharmacist, who can order a clinical pharmacogenetic test.</span></div>
+      ${drugTables(x)}
+    </div>`;
+  }
+
+  // ---------- ancestry and lineages ----------
+  const ANC_HUE = { EUR: 215, AFR: 30, EAS: 140, SAS: 330, AMR: 85 };
+  function ancestryBar(props) {
+    return `<div class="ancbar" role="img" aria-label="${props.map(([k, v]) => `${POP_LABEL[k]} ${Math.round(v * 100)}%`).join(', ')}">${props.filter(([, v]) => v >= 0.005).map(([k, v]) => `<i style="--h:${ANC_HUE[k]};--w:${(v * 100).toFixed(2)}%" title="${POP_LABEL[k]} ${(v * 100).toFixed(1)}%"></i>`).join('')}</div>`;
+  }
+  function lineageCards(p) {
+    const rc = p.readCheck;
+    if (!rc || !rc.mtHap) return `<section class="card"><div class="card-head"><h2>Maternal and paternal lineage</h2></div>
+      <p class="empty">Raw DNA files carry no mitochondrial or Y-chromosome data. Load the matching MyHeritage CRAM with “Check against reads” to add both.</p></section>`;
+    const mt = rc.mtHap, y = rc.yHap, d = rc.dosage;
+    if (d && !d.hasMT && !d.hasY) return `<section class="card" aria-labelledby="h-lin"><div class="card-head"><h2 id="h-lin">Maternal and paternal lineage</h2><span class="small muted">from ${esc(rc.file)}</span></div>
+      <p class="empty">This CRAM contains no mitochondrial or Y-chromosome reads (MyHeritage removes them before download), so haplogroups can’t be read from it. CRAM or BAM files from providers that keep chrM and chrY work.</p></section>${dosageCard(d)}`;
+    return `<section class="card" aria-labelledby="h-lin"><div class="card-head"><h2 id="h-lin">Maternal and paternal lineage</h2><span class="small muted">from ${esc(rc.file)}</span></div>
+      <dl class="kv">
+        <dt>Mitochondrial haplogroup (mother’s line)</dt><dd><b>${esc(mt.name || '—')}</b></dd>
+        <dt class="small">Fit to PhyloTree 17</dt><dd class="small num">${mt.name ? `${Math.round(mt.score * 100)}% · ${fmt(rc.mt.covered)} of 16,569 positions read, ${rc.mt.polys.length} differences from rCRS` : '—'}</dd>
+        <dt>Y-chromosome haplogroup (father’s line)</dt><dd><b>${y && y.name ? esc(y.name) : d && d.sex === 'female' ? 'None (no Y chromosome)' : '—'}</b></dd>
+        ${y && y.name ? `<dt class="small">Evidence</dt><dd class="small">${y.support} derived SNP${y.support === 1 ? '' : 's'} on this branch (${esc(y.markers.join(', '))}), ${y.conflict} against; ISOGG 2016 names</dd>` : ''}
+      </dl></section>
+      ${dosageCard(d)}`;
+  }
+  function dosageCard(d) {
+    return `${d ? `<section class="card" style="margin-top:var(--gap)" aria-labelledby="h-dose"><div class="card-head"><h2 id="h-dose">Chromosome dosage</h2><span class="small muted">read density vs. the autosomal median</span></div>
+        <p class="small" style="margin:0 0 10px">Sex chromosomes: X ${d.xr.toFixed(2)}${d.hasY ? `, Y ${d.yr.toFixed(2)}` : ' (no Y reads in this file)'} — ${d.sex ? `consistent with a ${d.sex} karyotype` : 'unusual; check the sequencing quality'}. ${d.flags.length ? `${d.flags.length} region${d.flags.length > 1 ? 's' : ''} of 20 Mb or more with unusual coverage (below).` : 'No autosome has unusual coverage over 20 Mb or more.'}</p>
+        <div class="dosage">${d.rows.map(r => `<span title="chr${r.chr}: ${r.ratio.toFixed(2)}"><i style="--v:${Math.min(1.6, r.ratio) / 1.6}"${(/\d/.test(r.chr) && Math.abs(r.ratio - 1) > 0.2) ? ' class="odd"' : ''}><u></u></i><b>${r.chr}</b></span>`).join('')}</div>
+        ${d.flags.length ? `<ul class="list" style="margin-top:12px">${d.flags.map(f => `<li><span>chr${f.chr}: ${f.start}–${f.end} Mb</span><span class="num">${f.ratio.toFixed(2)}×</span><span class="meta">${f.ratio < 1 ? 'fewer' : 'more'} reads than expected; at 1× coverage this is often noise, but large deletions or duplications look like this</span></li>`).join('')}</ul>` : ''}
+        <p class="small muted" style="margin:10px 0 0">Coarse: about 1.6 Mb per data point, so only whole-chromosome or very large changes can show.</p></section>` : ''}`;
+  }
+  function viewAncestry(p) {
+    const a = ancestryResult(p);
+    const top = a && a.props[0];
+    return `<div class="view">
+      ${titleRow('Ancestry', `Genetic ancestry estimated from ${a ? fmt(a.snps) : 'common'} SNPs against the five 1000 Genomes super-populations, plus lineages from sequencing reads.`, top ? `Mostly ${POP_LABEL[top[0]]} (${Math.round(top[1] * 100)}%).` : '', true, true)}
+      ${readNotice(p)}
+      ${a ? `<section class="card" aria-labelledby="h-adm" style="margin-bottom:var(--gap)"><div class="card-head"><h2 id="h-adm">Ancestry estimate</h2><span class="small muted">supervised admixture, 5 reference populations</span></div>
+        ${ancestryBar(a.props)}
+        <dl class="kv" style="margin-top:14px">${a.props.map(([k, v]) => `<dt><span class="swatch" style="--h:${ANC_HUE[k]}"></span>${POP_LABEL[k]}</dt><dd class="num">${(v * 100).toFixed(1)}%</dd>`).join('')}</dl>
+        <p class="small muted" style="margin:12px 0 0">Reference groups are continental; finer regions (e.g. Baltic vs. Scandinavian) cannot be separated with these panels. Admixed American references are partly European themselves, and shares under about 3% are within noise for a European genome.</p></section>` : '<p class="empty">pgs.js (allele frequencies) is missing.</p>'}
+      ${lineageCards(p)}
+    </div>`;
+  }
+
+  // ---------- HLA types (shown under Traits) ----------
+  const HLA_TAGS = [
+    { hla: 'HLA-B*27', id: 'rs4349859', alt: 'A', what: 'Ankylosing spondylitis and acute anterior uveitis risk (most carriers stay healthy)', ref: 'Evans et al. 2011, Nat Genet (PMID 21743469)' },
+    { hla: 'HLA-B*57:01', id: 'rs2395029', alt: 'G', what: 'Abacavir hypersensitivity', ref: 'Mallal et al. 2008, NEJM (PMID 18256392)' },
+    { hla: 'HLA-A*31:01', id: 'rs1061235', alt: 'T', what: 'Carbamazepine skin reactions', ref: 'McCormack et al. 2011, NEJM (PMID 21428769)' },
+    { hla: 'HLA-DQ2.5', id: 'rs2187668', alt: 'T', what: 'Celiac disease (about 90% of patients carry it)', ref: 'van Heel et al. 2007, Nat Genet (PMID 17558408)' },
+    { hla: 'HLA-DQ8', id: 'rs7454108', alt: 'C', what: 'Celiac disease and type 1 diabetes', ref: 'Monsuur et al. 2008, PLoS One (PMID 18509540)' },
+    { hla: 'HLA-DRB1*15:01', id: 'rs3135388', alt: 'A', what: 'Multiple sclerosis', ref: 'IMSGC 2007, NEJM (PMID 17660530)' },
+    { hla: 'HLA-C*06:02', id: 'rs10484554', alt: 'T', what: 'Psoriasis', ref: 'Liu et al. 2008, PLoS Genet (PMID 18369459)' },
+  ];
+  function hlaCard(p) {
+    return `<section class="card" style="margin-top:var(--gap)" aria-labelledby="h-hla"><div class="card-head"><h2 id="h-hla">HLA types</h2><span class="small muted">estimated from tag SNPs</span></div><div class="tablewrap">
+      <table class="rows"><thead><tr><th>HLA type</th><th>Tag SNP</th><th>Result</th><th>Relevance</th></tr></thead><tbody>
+      ${HLA_TAGS.map(t => { const r = p.geno.get(t.id); const k = r ? [...r.g].filter(c => c === t.alt).length : null;
+        return `<tr><td><b>${esc(t.hla)}</b></td><td>${r ? gtCells(r.g, t.alt) : '—'}<span class="id">${t.id}</span></td>
+        <td>${k === null ? '<span class="muted">Not in file</span>' : k ? `<span class="pill warn">Likely carried${k === 2 ? ' (2 copies)' : ''}</span>` : '<span class="pill">Not carried</span>'}</td>
+        <td class="effect">${esc(t.what)}<span class="gt-note" style="white-space:normal">${refHtml(t.ref)}</span></td></tr>`; }).join('')}</tbody></table></div>
+      <p class="small muted" style="margin:12px 0 0">Tag SNPs predict HLA types well in Europeans but not perfectly; clinical decisions need direct HLA typing.</p></section>`;
+  }
+
+  // ---------- family insights (Compare) ----------
+  function painting(seg) {
+    const rows = [...Array(22)].map((_, i) => {
+      const chr = i + 1, len = BP[chr] / BP[1] * 100;
+      const segs = seg.half.filter(s => s.chr === chr).map(s => `<i style="left:${s.start / BP[chr] * 100}%;width:${Math.max(0.4, (s.end - s.start) / BP[chr] * 100)}%"></i>`).join('');
+      const full = seg.full.filter(s => s.chr === chr).map(s => `<i class="ibd2" style="left:${s.start / BP[chr] * 100}%;width:${Math.max(0.4, (s.end - s.start) / BP[chr] * 100)}%"></i>`).join('');
+      return `<div class="chrom"><span class="num">${chr}</span><span class="bar" style="width:${len}%">${segs}${full}</span></div>`;
+    }).join('');
+    return `<div class="paint">${rows}</div>`;
+  }
+  function familyCards(ps) {
+    const pairs = [];
+    for (let i = 0; i < ps.length; i++) for (let j = i + 1; j < ps.length; j++) pairs.push([ps[i], ps[j]]);
+    const segs = pairs.map(([a, b]) => ({ a, b, s: (a.segCache ??= {})[b.file + b.name] ??= sharedSegments(a.geno, b.geno) }));
+    let html = `<section class="card" style="margin-top:var(--gap)" aria-labelledby="h-seg"><div class="card-head"><h2 id="h-seg">Shared DNA</h2><span class="small muted">segments of 7 cM or more</span></div>
+      ${segs.map(({ a, b, s }) => `<div class="pairhead"><b>${esc(a.name)} and ${esc(b.name)}</b><span class="num">${fmt(Math.round(s.total))} cM shared · ${s.half.length} segments · largest ${Math.round(s.largest)} cM${s.full2 > 50 ? ` · ${fmt(Math.round(s.full2))} cM fully identical` : ''}</span><span class="pill">${esc(cmReading(s))}</span></div>${painting(s)}`).join('')}
+      <p class="small muted" style="margin:12px 0 0">Blue: half-identical segments (one copy shared). Dark: fully identical (both copies), typical of siblings. Centimorgans are estimated from each chromosome’s average recombination rate.</p></section>`;
+    // Trios: a child with two parents among the people loaded
+    for (const c of ps) {
+      const parents = segs.filter(x => (x.a === c || x.b === c) && cmReading(x.s) === 'Parent and child').map(x => x.a === c ? x.b : x.a);
+      if (parents.length !== 2) continue;
+      let [m, f] = parents;
+      if (m.sex === 'male' && f.sex !== 'male') [m, f] = [f, m];
+      const me = mendelErrors(c.geno, m.geno, f.geno);
+      const items = [...c.plp.map(h => ({ gene: h.gene || '—', id: h.id, alt: h.alt, text: h.cond.split(';')[0] })),
+        ...c.notable.map(n => ({ gene: n.f.e.gene, id: n.f.r.id, alt: n.f.r.alt, text: n.f.e.trait }))];
+      html += `<section class="card" style="margin-top:var(--gap)" aria-labelledby="h-trio"><div class="card-head"><h2 id="h-trio">${esc(c.name)}: inherited from whom</h2><span class="small muted">mother ${esc(m.name)}, father ${esc(f.name)}${m.sex ? '' : ' (sex not determined from the files)'}</span></div>
+        <p class="small" style="margin:0 0 10px">${fmt(me.err)} of ${fmt(me.n)} SNPs (${(me.err / me.n * 100).toFixed(2)}%) fit neither parent — the genotyping error rate, and confirms the trio.</p>
+        <div class="tablewrap"><table class="rows"><thead><tr><th>Gene</th><th>Variant</th><th>${esc(c.name)}</th><th>${esc(m.name)}</th><th>${esc(f.name)}</th><th>Came from</th></tr></thead><tbody>
+        ${items.map(it => { const gc = c.geno.get(it.id), gm = m.geno.get(it.id), gf = f.geno.get(it.id); const o = gc && gm && gf ? originAt(gc.g, gm.g, gf.g) : null; const from = o && o[it.alt];
+          return `<tr><td class="gene"><b>${esc(it.gene)}</b><span class="id">${esc(it.id)}</span></td><td class="effect">${esc(it.text)}</td>
+          <td>${gc ? gtCells(gc.g, it.alt) : '—'}</td><td>${gm ? gtCells(gm.g, it.alt) : '—'}</td><td>${gf ? gtCells(gf.g, it.alt) : '—'}</td>
+          <td>${from === 'both' ? 'Both parents' : from === 'mother' ? esc(m.name) : from === 'father' ? esc(f.name) : '<span class="muted">Can’t tell</span>'}</td></tr>`; }).join('')}
+        </tbody></table></div></section>`;
+    }
+    // Couples: two unrelated people who carry variants in the same recessive gene
+    const moi = typeof GENE_MOI !== 'undefined' ? GENE_MOI : {};
+    const shared = [];
+    for (const { a, b, s } of segs) {
+      if (s.total > 200) continue;
+      const genes = g => new Map(g.plp.filter(h => h.gene && /AR|XL/.test(moi[h.gene] || '')).map(h => [h.gene, h]));
+      const ga = genes(a), gb = genes(b);
+      for (const [g, h] of ga) if (gb.has(g)) shared.push({ a, b, gene: g, ha: h, hb: gb.get(g) });
+    }
+    html += `<section class="card" style="margin-top:var(--gap)" aria-labelledby="h-couple"><div class="card-head"><h2 id="h-couple">Couple carrier check</h2><span class="small muted">unrelated pairs, recessive genes</span></div>
+      ${shared.length ? `<ul class="list">${shared.map(x => `<li><span><b>${esc(x.gene)}</b>: ${esc(x.a.name)} and ${esc(x.b.name)} both carry a variant</span><span class="pill bad">Shared carrier</span><span class="meta">${esc(x.ha.cond.split(';')[0])} · if they have children together, each child has a 25% chance of two copies (when both variants are truly disease-causing — confirm clinically)</span></li>`).join('')}</ul>`
+        : '<p class="empty">No recessive gene where two unrelated people loaded here both carry a pathogenic variant.</p>'}</section>`;
+    return html;
   }
 
   function cmpPeople() { return state.people.filter((_, i) => !state.cmpSel || state.cmpSel.has(i)); }
@@ -637,7 +1199,8 @@ if (typeof window !== 'undefined') (() => {
             <td><span class="pill ${h.sig === 'P' || h.sig === 'LP' ? 'bad' : h.sig === 'RF' ? 'warn' : h.sig === 'PR' ? 'good' : ''}">${SIG[h.sig]}</span></td>
             ${ps.map(p => { const r = p.geno.get(h.id); return `<td>${r ? gtCells(r.g, h.alt) : '<span class="muted">—</span>'}</td>`; }).join('')}</tr>`).join('')}
         </tbody></table></div>` : '<p class="empty">Everyone carries the same ClinVar-classified variants.</p>'}
-      </section></div>`;
+      </section>
+      ${familyCards(ps)}</div>`;
   }
   function markersTable() {
     const ps = cmpPeople();
@@ -671,6 +1234,10 @@ if (typeof window !== 'undefined') (() => {
         <p><b>Gene scan.</b> Every SNP is checked against NCBI ClinVar${hasClinvar() ? ` (${esc(CLINVAR_DATE)})` : ''}: pathogenic and likely pathogenic variants with at least one review star, plus risk factors, protective variants and drug responses. Refresh with <code>python build_clinvar.py --refresh</code>.</p>
         <p><b>Comparison.</b> Genotype match is the share of SNPs present in both files where both people have the same genotype. Relatedness uses autosomal SNPs only and the KING-robust kinship estimator (Manichaikul et al. 2010): about 0.25 for parent–child and full siblings, 0.125 for second-degree relatives; opposite homozygotes (e.g. AA against GG), near zero only between parent and child, separate those two. Health-profile similarity is 100 minus the mean gap between category scores.</p>
         <p><b>Read check.</b> A MyHeritage CRAM file holds the sequencing reads the genotype file was imputed from. “Check against reads” scans it in the browser and counts, at each ClinVar hit and curated marker, which bases the reads carry (mapping quality and base quality 20 or more). A variant “seen in reads” is confirmed directly; at about 1× coverage most sites have 0–2 reads, so “not seen” in one or two reads is weak evidence against a single copy. The CRAM must be aligned to GRCh37. If the reads disagree with the genotype file at more than 3% of bases, the check warns that they may belong to someone else.</p>
+        <p><b>Polygenic scores.</b> ${typeof PGS_SCORES !== 'undefined' ? PGS_SCORES.length : 'Published'} scores from the PGS Catalog, harmonised to GRCh37 and matched by rsID or position. Score = sum of weight × (copies of the effect allele − twice its European frequency), divided by the standard deviation expected under Hardy–Weinberg equilibrium; the percentile is the normal distribution at that z-score. Frequencies are from 1000 Genomes phase 3 Europeans; only variants present in the file count.</p>
+        <p><b>Medications.</b> Star alleles for CYP2C19, CYP2C9, CYP2D6, DPYD, TPMT, NUDT15, SLCO1B1, ABCG2, VKORC1, CYP4F2, CYP3A5, UGT1A1, CYP2B6, G6PD, two HLA tags and MT-RNR1 (from a CRAM) are called from the variants listed on the Medications page and mapped to phenotypes and dosing guidance following CPIC, or DPWG where CPIC has none. Rare alleles and structural variants are not detected.</p>
+        <p><b>Ancestry.</b> Supervised admixture: the share of each 1000 Genomes super-population (European, African, East Asian, South Asian, Admixed American) that best explains the genotypes, by expectation–maximisation over common SNPs. mtDNA haplogroups use PhyloTree build 17 (rCRS-rooted, as in HaploGrep) with HaploGrep’s phylogenetic weights; Y haplogroups use the ISOGG 2016 SNP index. Chromosome dosage compares read counts per CRAM container with the autosomal median.</p>
+        <p><b>Family.</b> Shared segments are runs without opposite homozygotes (half-identical) or with identical genotypes (fully identical), at least 7 cM and 500 SNPs, with isolated mismatches treated as errors; relationships follow the Shared cM Project ranges. In a parent–parent–child trio, the parent who passed on each allele is worked out where the genotypes allow it. Carrier status uses each gene’s mode of inheritance from GenCC.</p>
         <p><b>Limits.</b> Most traits depend on hundreds of variants plus lifestyle and environment; these scores cover a few known variants with mostly small effects (odds ratios 1.1–1.5), measured mainly in people of European ancestry. Consumer arrays and low-pass sequencing miss most rare mutations (most BRCA1/2 variants), copy-number changes and CYP2D6 duplications. This is education and research, not diagnosis — talk to a doctor or genetic counsellor before acting on a result.</p>
       </section></div>`;
   }
@@ -690,7 +1257,11 @@ if (typeof window !== 'undefined') (() => {
       <section><h2>At a glance</h2><div class="card">${glance(p)}</div></section>
       ${p.cats.filter(c => c.items.length).map(c => `<section><h2>${esc(c.name)} — ${pctTxt(c.score)}</h2><p class="sub small">${esc(c.desc)}</p><div class="card">${markerHead()}${c.items.map(i => markerRow(i.f, i.val, i.w)).join('')}</tbody></table></div></section>`).join('')}
       ${traits.length ? `<section><h2>Traits</h2><div class="card">${markerHead()}${traits.map(f => markerRow(f)).join('')}</tbody></table></div></section>` : ''}
-      ${p.hits.length ? `<section><h2>ClinVar gene scan</h2><div class="card">${cvHead()}${cvRows(p.hits)}</tbody></table></div></section>` : ''}
+      ${p.hits.length ? `<section><h2>ClinVar gene scan</h2>${carrierSummary(p)}<div class="card">${cvHead()}${cvRows(p.hits)}</tbody></table></div></section>` : ''}
+      ${pgsResults(p) ? `<section><h2>Polygenic scores</h2><div class="card">${pgsTable(pgsResults(p))}</div></section>` : ''}
+      ${pgxResult(p) ? `<section><h2>Medications</h2>${drugTables(pgxResult(p))}</section>` : ''}
+      ${ancestryResult(p) ? `<section><h2>Ancestry</h2><div class="card">${ancestryBar(ancestryResult(p).props)}<p class="small">${ancestryResult(p).props.map(([k, v]) => `${POP_LABEL[k]} ${(v * 100).toFixed(1)}%`).join(' · ')}</p></div>${lineageCards(p)}</section>` : ''}
+      <section><h2>HLA types</h2>${hlaCard(p)}</section>
       <section>${viewMethod().replace(/<div class="view">|<\/div>$/g, '')}</section></div>`;
   }
   function staticize(html) {
@@ -745,6 +1316,9 @@ if (typeof window !== 'undefined') (() => {
     main.innerHTML = view === 'category' ? viewCategory(p, arg)
       : view === 'genes' ? viewGenes(p)
       : view === 'traits' ? viewTraits(p)
+      : view === 'pgs' ? viewPGS(p)
+      : view === 'drugs' ? viewDrugs(p)
+      : view === 'ancestry' ? viewAncestry(p)
       : view === 'compare' ? viewCompare()
       : view === 'method' ? viewMethod()
       : viewOverview(p);
@@ -784,7 +1358,8 @@ if (typeof window !== 'undefined') (() => {
     const b = e.target.closest('button');
     if (!b) return;
     if (b.dataset.rm !== undefined) {
-      state.people.splice(+b.dataset.rm, 1);
+      const [gone] = state.people.splice(+b.dataset.rm, 1);
+      store.remove(gone.name, gone.file);
       state.cur = Math.min(state.cur, Math.max(0, state.people.length - 1));
       state.cmpSel = null;
     } else state.cur = +b.dataset.i;
@@ -795,13 +1370,14 @@ if (typeof window !== 'undefined') (() => {
 
   // ---------- read check ----------
   let cramLib;
-  const loadCramLib = () => cramLib ??= new Promise((ok, fail) => {
+  const loadScript = src => new Promise((ok, fail) => {
     const s = document.createElement('script');
-    s.src = 'vendor/cram.js';
-    s.onload = () => ok(window.CramLib);
-    s.onerror = () => fail(new Error('Could not load vendor/cram.js, the CRAM reader.'));
+    s.src = src;
+    s.onload = ok;
+    s.onerror = () => fail(new Error(`Could not load ${src}.`));
     document.head.appendChild(s);
   });
+  const loadCramLib = () => cramLib ??= Promise.all([loadScript('vendor/cram.js'), loadScript('haplo.js')]).then(() => window.CramLib);
   async function checkReads(file) {
     const p = P();
     if (!p || state.readJob) return;
@@ -811,8 +1387,12 @@ if (typeof window !== 'undefined') (() => {
     try {
       const lib = await loadCramLib();
       const sites = readSites(p);
+      // Lineages: every mitochondrial position, and the ISOGG Y SNPs (all sites need their reference base)
+      const extra = [];
+      for (let pos = 1; pos <= 16569; pos++) if (MT_REF[pos - 1] !== 'N') extra.push({ id: 'MT:' + pos, chr: 'MT', pos, ref: MT_REF[pos - 1] });
+      if (p.sex !== 'female') for (const [pos, , , , , ref] of Y_SNPS) extra.push({ id: 'Y:' + pos, chr: 'Y', pos, ref });
       let last = 0;
-      const res = await runReadCheck(file, sites, lib.CramFile, lib.BlobFile, k => {
+      const res = await runReadCheck(file, [...sites, ...extra], lib.CramFile, lib.BlobFile, k => {
         const now = performance.now();
         if (now - last < 100 && k < 1) return;
         last = now;
@@ -822,7 +1402,12 @@ if (typeof window !== 'undefined') (() => {
       });
       let n = 0, disc = 0;
       for (const x of sites) for (const [b, c] of Object.entries(res.obs.get(x.id))) { n += c; if (!p.geno.get(x.id).g.includes(b)) disc += c; }
-      p.readCheck = { file: file.name, obs: res.obs, ref: new Map(sites.map(x => [x.id, x.ref])), n, disc, reads: res.reads };
+      const mt = mtConsensus(res.obs);
+      p.readCheck = { file: file.name, obs: res.obs, ref: new Map(sites.map(x => [x.id, x.ref])), n, disc, reads: res.reads,
+        mt, mtHap: mt.covered > 1000 ? mtHaplogroup(mt, MT_TREE, MT_WEIGHTS, MT_REF) : { name: null },
+        yHap: yHaplogroup(res.obs, Y_SNPS), dosage: chromosomeDosage(res.depth, res.seqNames) };
+      if (!p.readCheck.dosage.hasMT) p.readCheck.mt = null; // no mitochondrial reads: MT-RNR1 stays untested
+      p._pgx = null; // MT-RNR1 can now be called
     } catch (err) {
       p.readError = `${file.name}: ${err.message}`;
     }
@@ -830,6 +1415,42 @@ if (typeof window !== 'undefined') (() => {
     render();
   }
   $('#cramFile').onchange = e => { if (e.target.files[0]) checkReads(e.target.files[0]); e.target.value = ''; };
+
+  // ---------- saved sessions (opt-in; raw files kept in this browser's IndexedDB only) ----------
+  const store = {
+    on: () => { try { return localStorage.getItem('allele.remember') === '1'; } catch { return false; } },
+    db: () => new Promise((ok, fail) => {
+      const r = indexedDB.open('allele', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('people', { keyPath: 'key' });
+      r.onsuccess = () => ok(r.result);
+      r.onerror = () => fail(r.error);
+    }),
+    async tx(mode, fn) {
+      const db = await store.db();
+      return new Promise((ok, fail) => {
+        const t = db.transaction('people', mode), os = t.objectStore('people'), req = fn(os);
+        t.oncomplete = () => ok(req && req.result);
+        t.onerror = () => fail(t.error);
+      });
+    },
+    save: (name, file, text) => store.on() && store.tx('readwrite', os => os.put({ key: name + '|' + file, name, file, text })).catch(() => {}),
+    remove: (name, file) => store.tx('readwrite', os => os.delete(name + '|' + file)).catch(() => {}),
+    clear: () => store.tx('readwrite', os => os.clear()).catch(() => {}),
+    all: () => store.tx('readonly', os => os.getAll()).catch(() => []),
+  };
+  $('#remember').checked = store.on();
+  $('#remember').onchange = e => {
+    try { localStorage.setItem('allele.remember', e.target.checked ? '1' : '0'); } catch {}
+    if (e.target.checked) state.people.forEach(p => p._text && store.save(p.name, p.file, p._text));
+    else store.clear();
+  };
+  function addPerson(name, file, text, data) {
+    if (state.people.some(p => p.name === name)) name += ` (${state.people.length + 1})`;
+    const p = buildPerson(name, file, data, HUES[state.people.length % HUES.length]);
+    p._text = text; // kept so it can be saved if "remember" is switched on later
+    state.people.push(p);
+    store.save(name, file, text);
+  }
 
   async function readFiles(files) {
     files = [...files].filter(f => f.size);
@@ -851,11 +1472,10 @@ if (typeof window !== 'undefined') (() => {
         await new Promise(r => setTimeout(r));
       }
       if (geno.size < 1000) { state.error = `${file.name}: no genotype rows found. Expected columns rsid, chromosome, position, genotype.`; continue; }
-      let name = personName(file.name);
-      if (state.people.some(p => p.name === name)) name += ` (${state.people.length + 1})`;
+      const name = personName(file.name);
       setProgress(1, `Scoring ${name}`);
       await new Promise(r => setTimeout(r));
-      state.people.push(buildPerson(name, file.name, { geno, meta }, HUES[state.people.length % HUES.length]));
+      addPerson(name, file.name, text, { geno, meta });
     }
     if (state.people.length > before) {
       state.cur = before;
@@ -886,4 +1506,11 @@ if (typeof window !== 'undefined') (() => {
   $('#ver').textContent = `Allele ${VERSION}`;
   window.allele = { readFiles, state }; // handy for debugging from the console
   render();
+  if (store.on()) store.all().then(async saved => {
+    for (const x of saved || []) {
+      if (state.people.some(p => p.name === x.name && p.file === x.file)) continue;
+      addPerson(x.name, x.file, x.text, parseRaw(x.text));
+    }
+    if (saved && saved.length) render();
+  });
 })();
