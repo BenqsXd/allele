@@ -572,7 +572,7 @@ if (typeof window !== 'undefined') (() => {
   const isCompare = () => location.hash.startsWith('#/compare') && cmpPeople().length > 1;
   function doDownload() {
     const name = isCompare() ? 'DNA comparison ' + cmpPeople().map(p => p.name).join(' ') : 'DNA report ' + P().name;
-    const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${esc(name)}</title><link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet"><style>${document.getElementById('css').textContent}</style></head><body>${exportHTML()}</body></html>`;
+    const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${esc(name)}</title><style>${document.getElementById('css').textContent}</style></head><body>${exportHTML()}</body></html>`;
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
     a.download = name.replace(/\s+/g, '_') + '.html';
@@ -692,7 +692,8 @@ if (typeof window !== 'undefined') (() => {
   addEventListener('dragover', e => e.preventDefault());
   addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer.files.length) readFiles(e.dataTransfer.files); });
 
-  window.onClinvar = () => { state.people.forEach(refreshClinvar); render(); };
+  // clinvar.js is deferred; it has run by DOMContentLoaded (or failed to load, and the gene scan says so)
+  addEventListener('DOMContentLoaded', () => { state.people.forEach(refreshClinvar); render(); });
   window.allele = { readFiles, state }; // handy for debugging from the console
   render();
 })();
